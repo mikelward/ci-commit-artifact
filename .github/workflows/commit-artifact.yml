@@ -405,6 +405,27 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # The dest-path validation earlier rejects a .git path COMPONENT
+          # in dest-path itself, but has no way to see what's inside the
+          # artifact the download step just extracted — a render that
+          # happens to produce a nested .git file or directory (a fixture
+          # repo, say) lands here undetected. `git add -f` doesn't fail on
+          # a .git entry, it silently SKIPS it while still staging
+          # everything else: verified directly, `git add -f -A --
+          # out/example` with out/example/.git/config and
+          # out/example/real.txt present stages only real.txt, exit 0,
+          # nothing said about the dropped one. That's a successful-looking
+          # commit that's silently missing part of the artifact — worse
+          # than the "nothing staged at all" case dest-path's own .git
+          # check guards, since there's no empty-diff signal to catch it.
+          # `find -name .git` matches the exact basename at any depth, so
+          # this catches both a `.git` directory and a stray `.git` file.
+          git_entries=$(find "$DEST_PATH" -name .git)
+          if [ -n "$git_entries" ]; then
+            echo "::error::the artifact contains .git entries under $DEST_PATH, which git add -f silently skips rather than staging or erroring on:"
+            echo "$git_entries" | sed 's/^/::error::  /'
+            exit 1
+          fi
           # -f (force): dest-path was rm -rf'd and freshly re-extracted from
           # the artifact above, so everything under it right now IS the
           # artifact's own content — not a mix where a caller's .gitignore
