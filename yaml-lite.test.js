@@ -141,6 +141,21 @@ test("literal block scalar chomping: default clip at true EOF also matches wheth
   assert.equal(withFinalNewline.a, "x\n");
 });
 
+test("literal and folded block scalar chomping: a blank-only body clips and strips to empty, but keep preserves it", () => {
+  // Verified against yaml.safe_load: `a: |\n\nb: 1\n` -> {'a': '', 'b': 1},
+  // not {'a': '\n', 'b': 1} — a block scalar whose only collected line is
+  // blank clips to "", the same as no content at all. Keep (+) is the one
+  // mode that preserves it: `a: |+\n\nb: 1\n` -> {'a': '\n', 'b': 1}.
+  assert.equal(parseWorkflowYaml("a: |\n\nb: 1\n").a, "");
+  assert.equal(parseWorkflowYaml("a: |-\n\nb: 1\n").a, "");
+  assert.equal(parseWorkflowYaml("a: |+\n\nb: 1\n").a, "\n");
+  assert.equal(parseWorkflowYaml("a: >\n\nb: 1\n").a, "");
+  // Two blank lines behave the same way under clip/strip, and keep preserves
+  // both: yaml.safe_load("a: |+\n\n\nb: 1\n") -> {'a': '\n\n', 'b': 1}.
+  assert.equal(parseWorkflowYaml("a: |\n\n\nb: 1\n").a, "");
+  assert.equal(parseWorkflowYaml("a: |+\n\n\nb: 1\n").a, "\n\n");
+});
+
 test("parses a folded block scalar (>) as GitHub Actions description fields use it", () => {
   const doc = parseWorkflowYaml(
     "description: >-\n  Line one\n  line two.\n",
