@@ -135,6 +135,21 @@ function parseWorkflowYaml(text) {
     if (s.startsWith("&") || s.startsWith("*")) {
       throw new Error(`yaml-lite: anchors/aliases are not supported (got ${JSON.stringify(s)})`);
     }
+    // A scalar that OPENS a quote must genuinely close it, right at its own
+    // last character — not just happen to end in a quote character (an
+    // escaped one doesn't count) and not fail to close at all. A blind
+    // `startsWith(q) && endsWith(q)` check (what the branches below relied
+    // on alone) treats `"example` — no closing quote anywhere — as an
+    // ordinary plain scalar starting with a literal `"`, silently returning
+    // the malformed text instead of catching that GitHub's own parser
+    // rejects it outright. Verified against yaml.safe_load('name: "example\n'),
+    // which raises a ScannerError for "unexpected end of stream" rather than
+    // returning a value. Reachable both directly and via a flow-sequence
+    // element (splitFlowSequence hands an unterminated quoted element to
+    // this same function), so one check here covers both.
+    if ((s.startsWith("'") && !hasClosingQuote(s, "'")) || (s.startsWith('"') && !hasClosingQuote(s, '"'))) {
+      throw new Error(`yaml-lite: unterminated quoted scalar (got ${JSON.stringify(s)})`);
+    }
     if (/^-?\d+$/.test(s)) return parseInt(s, 10);
     if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
     if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) {
@@ -149,6 +164,31 @@ function parseWorkflowYaml(text) {
       return splitFlowSequence(inner).map(parseScalar);
     }
     return s;
+  }
+
+  // Whether `s` (which starts with `quoteChar`) has a genuine, unescaped
+  // closing quote as its very last character. Forward scan skipping the
+  // character after a backslash inside a double-quoted run, and a doubled
+  // `''` inside a single-quoted one — the same escape-tracking style as
+  // stripInlineComment and splitFlowSequence below, kept consistent rather
+  // than reinvented, since getting this asymmetric by accident is exactly
+  // how this file's earlier quote-handling bugs happened.
+  function hasClosingQuote(s, quoteChar) {
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (quoteChar === '"' && ch === "\\") {
+        i++; // skip the escaped character
+        continue;
+      }
+      if (ch === quoteChar) {
+        if (quoteChar === "'" && s[i + 1] === "'") {
+          i++; // escaped '' inside a single-quoted scalar
+          continue;
+        }
+        return i === s.length - 1;
+      }
+    }
+    return false;
   }
 
   // Same escape handling as stripInlineComment, and for the same reason: a
