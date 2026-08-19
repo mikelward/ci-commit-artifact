@@ -250,6 +250,27 @@ jobs:
             ""|.|/|/*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
           esac
           resolved=$(cd "$GITHUB_WORKSPACE" && realpath -m -- "$DEST_PATH")
+          # dest-path's STRING is owner-configured, but whatever's actually
+          # on disk at that path comes from the checkout of branch-ref — a
+          # PR the caller is rendering — so a symlink there is PR-controlled
+          # content. realpath -m follows symlinks in every existing leading
+          # component, so a PR that replaces (say) "snapshots" with a
+          # symlink to another real directory elsewhere in the checkout
+          # (anywhere but .git, which is already blocked below) makes
+          # $resolved silently point at that other directory instead — the
+          # containment checks below pass, and this step deletes whatever
+          # the symlink targets rather than the location the caller named.
+          # Verified directly: a symlink at dest-path pointing at a sibling
+          # directory gets its TARGET's contents deleted while the symlink
+          # itself survives, dangling. Comparing against `realpath -sm`
+          # (identical, but never follows a symlink) catches a symlink
+          # anywhere in the path — direct or in an intermediate component —
+          # without walking components by hand.
+          literal=$(cd "$GITHUB_WORKSPACE" && realpath -sm -- "$DEST_PATH")
+          if [ "$resolved" != "$literal" ]; then
+            echo "::error::dest-path ($DEST_PATH) resolves through a symlink to $resolved — refusing to delete a symlinked location"
+            exit 1
+          fi
           case "$resolved" in
             "$GITHUB_WORKSPACE")
               echo "::error::dest-path resolves to the checkout root ($resolved) — refusing to delete it"; exit 1 ;;
