@@ -39,7 +39,16 @@ test("has no workflow-level permissions block wider than the single job's own", 
   // workflow-level block here would either be redundant or, worse, silently
   // widen what the job gets beyond its own declared needs.
   assert.equal(doc.permissions, undefined);
-  assert.ok(doc.jobs.commit.permissions, "the commit job should declare its own permissions");
+  // Exact values, not just truthiness — a truthiness-only check stays green
+  // even if a scope silently widens (or narrows to the point of breaking
+  // the job) to something other than what's actually needed: contents:write
+  // to push the commit, pull-requests:write for the freshness comment,
+  // actions:write for the download-artifact read + workflow dispatch.
+  assert.deepEqual(doc.jobs.commit.permissions, {
+    contents: "write",
+    "pull-requests": "write",
+    actions: "write",
+  });
 });
 
 test("declares every required input, and every optional one with a default", () => {

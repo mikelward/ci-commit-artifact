@@ -160,6 +160,23 @@ function parseWorkflowYaml(text) {
     if ((s.startsWith("'") && !hasClosingQuote(s, "'")) || (s.startsWith('"') && !hasClosingQuote(s, '"'))) {
       throw new Error(`yaml-lite: unterminated quoted scalar (got ${JSON.stringify(s)})`);
     }
+    if (s.startsWith("{") && s.endsWith("}")) {
+      // An empty flow mapping ("permissions: {}", least-privilege
+      // workflows' standard idiom) is unambiguous and costs nothing to
+      // support. A NON-empty one ("{ contents: read }") is out of this
+      // parser's scope (see the file header) — real, valid YAML that
+      // yaml.safe_load parses into a genuine nested object, but this
+      // parser previously returned the brace text as a literal STRING
+      // instead, silently wrong rather than merely unsupported (the file
+      // header's own stated contract is to throw on out-of-scope
+      // constructs, not guess). Reachable both as a plain mapping value
+      // and as a sequence item's scalar ("- { a: 1 }" falls through the
+      // "- key: value" check in parseSequence, since its rest starts with
+      // "{" rather than a bare key, straight into this function).
+      const inner = s.slice(1, -1).trim();
+      if (inner === "") return {};
+      throw new Error(`yaml-lite: flow mappings are not supported (got ${JSON.stringify(s)})`);
+    }
     if (/^-?\d+$/.test(s)) return parseInt(s, 10);
     if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
     if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) {
@@ -428,6 +445,19 @@ function parseWorkflowYaml(text) {
     return result;
   }
 
+  // Verified against yaml.safe_load("a: 1\na: 2\n"), which raises a
+  // ConstructorError under a duplicate-key-rejecting loader (PyYAML's
+  // default SafeLoader is lenient and keeps the last value, but rejecting
+  // is the spec-correct, commonly-enforced reading) — silently keeping the
+  // last value here would hide a workflow author's copy-paste mistake
+  // (two "permissions:" blocks, the second one clobbering the first)
+  // rather than surfacing it.
+  function checkDuplicateKey(target, key, lineNumber) {
+    if (Object.prototype.hasOwnProperty.call(target, key)) {
+      throw new Error(`yaml-lite: duplicate mapping key ${JSON.stringify(key)} at line ${lineNumber}`);
+    }
+  }
+
   function parseInlineMappingItem(firstLineRest, siblingIndent, firstLineRawIndex) {
     const obj = {};
     applyMappingEntry(obj, firstLineRest, siblingIndent, firstLineRawIndex);
@@ -440,6 +470,7 @@ function parseWorkflowYaml(text) {
 
     function applyMappingEntry(target, content, ownIndent, rawIndex) {
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(content);
+      checkDuplicateKey(target, key, rawLines[rawIndex].n);
       if (isBlockScalar) {
         target[key] = parseBlockScalar(style, chomp, ownIndent, rawIndex + 1);
       } else if (rest === "") {
@@ -472,6 +503,7 @@ function parseWorkflowYaml(text) {
       const line = structural[pos];
       pos++;
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(line.content);
+      checkDuplicateKey(obj, key, line.n);
       if (isBlockScalar) {
         obj[key] = parseBlockScalar(style, chomp, indent, line.rawIndex + 1);
       } else if (rest === "") {
