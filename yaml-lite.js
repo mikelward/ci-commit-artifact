@@ -145,6 +145,20 @@ function parseWorkflowYaml(text) {
     if (s.startsWith("&") || s.startsWith("*")) {
       throw new Error(`yaml-lite: anchors/aliases are not supported (got ${JSON.stringify(s)})`);
     }
+    // Tags ("!!str foo", "!custom bar") are explicitly out of this file's
+    // header-stated scope, same as anchors/aliases above — but unlike
+    // anchors/aliases, a tagged scalar isn't even always invalid YAML:
+    // yaml.safe_load resolves "!!str ubuntu-latest" to the plain string
+    // "ubuntu-latest" (a standard, known tag), while it genuinely errors
+    // on "!custom value" ("could not determine a constructor"). This
+    // parser draws no distinction between the two — both throw, since
+    // implementing tag resolution is out of scope either way and silently
+    // returning "!!str ubuntu-latest" as the literal 18-character string
+    // (this file's previous behavior, via the plain-scalar fallback) is
+    // wrong regardless of which case it is.
+    if (s.startsWith("!")) {
+      throw new Error(`yaml-lite: tags are not supported (got ${JSON.stringify(s)})`);
+    }
     // A scalar that OPENS a quote must genuinely close it, right at its own
     // last character — not just happen to end in a quote character (an
     // escaped one doesn't count) and not fail to close at all. A blind
@@ -225,6 +239,23 @@ function parseWorkflowYaml(text) {
       const inner = s.slice(1, -1).trim();
       if (inner === "") return [];
       return splitFlowSequence(inner).map(parseScalar);
+    }
+    // An unquoted plain scalar containing ": " (colon then whitespace) or
+    // ending in a bare ":" is invalid where it's reachable from — both a
+    // block mapping's value ("runs-on: ubuntu: latest", genuinely
+    // ambiguous YAML: a colon followed by whitespace/EOL always reads as
+    // a nested mapping-value indicator, never scalar content) and a flow
+    // sequence element ("[b: c]", which real YAML resolves as a flow
+    // MAPPING shorthand — {b: 'c'} — a construct this parser doesn't
+    // implement, so silently returning it as the literal string "b: c"
+    // would be wrong the same way an unimplemented flow mapping is
+    // elsewhere in this file). Verified against yaml.safe_load: "a: b: c"
+    // and "a: b:\tc" both raise "mapping values are not allowed here";
+    // "a: [b: c]" parses as [{'b': 'c'}], not a scalar. A colon NOT
+    // followed by whitespace ("http://x.com", "1:30", "b:c") is
+    // unambiguous and stays a plain scalar.
+    if (/:\s|:$/.test(s)) {
+      throw new Error(`yaml-lite: unquoted ": " or trailing ":" in a plain scalar (got ${JSON.stringify(s)})`);
     }
     return s;
   }

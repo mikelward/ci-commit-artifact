@@ -363,6 +363,63 @@ test("throws on an empty element in a flow sequence, while still allowing a sing
   assert.deepEqual(doc["runs-on"], ["ubuntu-latest", "other"]);
 });
 
+test("throws on an unquoted ': ' inside a plain scalar, in both block and flow-sequence context", () => {
+  // "runs-on: ubuntu: latest" previously fell through to the plain-scalar
+  // return, silently accepting "ubuntu: latest" as ordinary text. Verified
+  // against yaml.safe_load, which raises a ParserError ("mapping values
+  // are not allowed here") — a colon followed by whitespace (or at the
+  // very end of the scalar) always reads as a nested mapping-value
+  // indicator in real YAML, never as scalar content, whether the
+  // whitespace is a space or a tab.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: ubuntu: latest\n"),
+    /unquoted/,
+  );
+  assert.throws(() => parseWorkflowYaml("a: b:\tc\n"), /unquoted/);
+  assert.throws(() => parseWorkflowYaml("a: b:\n"), /unquoted/);
+  assert.throws(() => parseWorkflowYaml("a: b : c\n"), /unquoted/);
+
+  // Inside a flow sequence, "[b: c]" isn't invalid YAML at all — it's a
+  // flow-mapping SHORTHAND (yaml.safe_load resolves it to [{'b': 'c'}]),
+  // a construct this minimal parser doesn't implement any more than it
+  // implements bracketed "{ b: c }". Silently returning the literal
+  // string "b: c" would be the same kind of wrong as silently returning
+  // an unsupported flow mapping's brace text, so this rejects it the same
+  // way rather than only catching the block-mapping-value shape.
+  assert.throws(() => parseWorkflowYaml("a: [b: c]\n"), /unquoted/);
+
+  // A colon NOT followed by whitespace is unambiguous and must still parse.
+  assert.equal(parseWorkflowYaml("a: http://x.com\n").a, "http://x.com");
+  assert.equal(parseWorkflowYaml("a: 1:30\n").a, "1:30");
+  // A colon-space INSIDE a quoted scalar is unaffected — the rule only
+  // applies to plain (unquoted) scalars, which is exactly the branch this
+  // check lives in; a quoted scalar returns earlier and never reaches it.
+  assert.equal(parseWorkflowYaml('a: "b: c"\n').a, "b: c");
+});
+
+test("throws on a tagged scalar, whether the tag is a standard resolvable one or a custom one", () => {
+  // "runs-on: !!str ubuntu-latest" and "a: !custom value" both previously
+  // fell through to the plain-scalar return, silently returning the tag
+  // and payload together as one literal string. Tags are explicitly out
+  // of this file's stated scope (see the file header), same as
+  // anchors/aliases just above this check — and unlike anchors/aliases,
+  // not every tagged scalar is even invalid YAML: yaml.safe_load resolves
+  // "!!str ubuntu-latest" (a standard, known tag) to the plain string
+  // "ubuntu-latest", while "!custom value" (an unknown local tag)
+  // genuinely errors ("could not determine a constructor"). This parser
+  // draws no distinction between the two cases — both are out of scope,
+  // so both throw, rather than only rejecting the one real YAML itself
+  // would also reject.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: !!str ubuntu-latest\n"),
+    /tags are not supported/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: !custom value\n"),
+    /tags are not supported/,
+  );
+});
+
 test("prefers the more specific unterminated-quote error over a generic bracket-imbalance one", () => {
   // 'a: ["b, c]' has an unterminated quote AND, read as pure bracket
   // counting, an "imbalance" (the quote swallows the sequence's own
