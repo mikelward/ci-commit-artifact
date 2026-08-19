@@ -129,9 +129,28 @@ jobs:
       commit_sha: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
     steps:
       - name: Validate the input combination
-        # Fails fast, before checkout or any real work. Two independent
-        # things can be wrong with pr-number, checked separately so the
-        # error names the actual mistake:
+        # Fails fast, before checkout or any real work. Runs unconditionally
+        # — unlike the pr-number checks below (only relevant when a caller
+        # sets one of the optional inputs that needs it), expected-head-sha
+        # is always required and always worth checking, so this step can't
+        # skip itself the way it used to.
+        #
+        # expected-head-sha must look like a real SHA. A caller typically
+        # supplies github.event.pull_request.head.sha — a context field
+        # that's EMPTY on an event where pull_request doesn't exist (a
+        # workflow_dispatch, say), and `required: true` on a workflow_call
+        # input only checks the caller supplied the KEY, not that its value
+        # is non-empty or well-formed. Without this check, an empty or
+        # malformed value would compare unequal to guard's real
+        # actual_head_sha unconditionally, and the mismatch branch reads
+        # that as "branch-ref advanced, skip" — a caller CONFIGURATION
+        # error silently absorbed as the ordinary, expected race this
+        # workflow already handles, rather than surfaced as the bug it is.
+        # GitHub's git backend is SHA-1 today (40 lowercase hex chars); this
+        # doesn't attempt to anticipate a future SHA-256 migration.
+        #
+        # Two independent things can be wrong with pr-number, checked
+        # separately so the error names the actual mistake:
         #   - it's '' while comment-marker's freshness comment or
         #     dispatch-workflow's `-f pr="$PR_NUMBER"` needs a real one —
         #     both silently no-op or pass an empty string otherwise, which a
@@ -145,16 +164,17 @@ jobs:
         #     silent skip (continue-on-error, by design, for genuine API
         #     hiccups), which would hide a caller misconfiguration behind
         #     the same "no comment posted" symptom as a transient failure.
-        # Only runs when there's something to check — this step's own `if:`
-        # keeps a caller that never sets any of these three inputs from
-        # paying for it.
-        if: inputs.pr-number != '' || inputs.comment-marker != '' || inputs.dispatch-workflow != ''
         env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
           COMMENT_MARKER: ${{ inputs.comment-marker }}
           DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
         run: |
           set -euo pipefail
+          if ! [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected-head-sha must be a full 40-character commit SHA, got '$EXPECTED_HEAD_SHA' — check the caller's expression (e.g. github.event.pull_request.head.sha is empty on events without a pull_request context)."
+            exit 1
+          fi
           if [ -z "$PR_NUMBER" ] && { [ -n "$COMMENT_MARKER" ] || [ -n "$DISPATCH_WORKFLOW" ]; }; then
             echo "::error::pr-number is '' but comment-marker or dispatch-workflow is set — both need a PR to act on. Pass pr-number, or clear comment-marker/dispatch-workflow to skip them."
             exit 1
@@ -240,7 +260,17 @@ jobs:
             *)
               echo "::error::dest-path resolves outside the checkout: $resolved"; exit 1 ;;
           esac
-          rm -rf -- "$DEST_PATH"
+          # $resolved, not the raw $DEST_PATH: realpath -m collapses '..'
+          # lexically, but rm resolves a path by actually traversing each
+          # component — a dest-path like "missing/../snapshots", where
+          # "missing" doesn't exist, validates fine (it resolves to
+          # .../snapshots, safely inside the checkout) but then silently
+          # deletes NOTHING when passed to rm literally: -f suppresses the
+          # "no such file or directory" from the failed traversal into the
+          # nonexistent "missing" component. Verified directly. $resolved
+          # is already the exact, already-validated absolute path with no
+          # residual '..' to mis-traverse.
+          rm -rf -- "$resolved"
 
       - name: Download the artifact
         id: download
@@ -347,14 +377,24 @@ jobs:
           COMMIT_OUTCOME: ${{ steps.commit.outcome }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
           HEAD_SHA: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
+          # A WORKFLOW INPUT, not a step output — unlike HEAD_SHA (unset
+          # when guard never completed), this is always present regardless
+          # of which step failed, so it's the only reliable "what state was
+          # THIS run even about" signal available to the early-failure
+          # branch below.
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
         with:
           script: |
             const marker = process.env.COMMENT_MARKER;
             const noun = process.env.ARTIFACT_NOUN;
-            const headSha = (process.env.HEAD_SHA || '').slice(0, 7);
             const prNumber = Number(process.env.PR_NUMBER);
 
             let status;
+            // The SHA this run's report is actually about — HEAD_SHA by
+            // default, overridden to EXPECTED_HEAD_SHA in the early-failure
+            // branch below, where HEAD_SHA is often empty. Declared here,
+            // not const, specifically so that branch can redirect it.
+            let referenceHeadSha = process.env.HEAD_SHA;
             // Set only in the "guard confirmed the branch was genuinely at
             // expected-head-sha" branch below — the one branch where a
             // live-head re-check right before writing is both meaningful
@@ -369,12 +409,23 @@ jobs:
             // from any of them means the job failed BEFORE the download step
             // ever got a chance to run — distinct from download itself
             // failing or finding nothing, which a later branch reports.
-            // Handled FIRST and unconditionally, with no live-head re-check
-            // (added below): guard may not have even run, so HEAD_SHA can be
-            // empty here, and a re-check gated on it would make this branch
-            // unreachable — an early failure is worth surfacing regardless
-            // of what any other overlapping run goes on to report.
+            // Handled FIRST — but NOT unconditionally: an older overlapping
+            // run can hit a transient checkout/guard/clear failure AFTER a
+            // newer run (triggered by a later push) has already posted its
+            // own accurate report, and posting here unconditionally would
+            // overwrite that accurate, current report with a stale warning
+            // about a head the PR has moved past. HEAD_SHA is unreliable for
+            // the usual live-head check here (guard may not have even run,
+            // so it can be empty) — EXPECTED_HEAD_SHA stands in instead: a
+            // WORKFLOW INPUT this run received regardless of what failed, so
+            // it's always available, and it names exactly the head this
+            // failed run was trying to act on. If the PR's live head still
+            // matches it, nothing has moved and this failure is exactly what
+            // the PR's current state needs reported; if not, a newer run
+            // already owns the report.
             if (process.env.CHECKOUT_OUTCOME !== 'success' || process.env.GUARD_OUTCOME !== 'success' || process.env.CLEAR_OUTCOME === 'failure') {
+              needsLiveHeadCheck = true;
+              referenceHeadSha = process.env.EXPECTED_HEAD_SHA;
               status = `⚠️ An earlier step failed before the artifact could be checked — see the run log.`;
             } else if (process.env.SKIPPED === 'true') {
               // A skipped run observed the branch already past
@@ -432,7 +483,7 @@ jobs:
                 status = `✅ ${noun}s up-to-date — no changes from this push.`;
               }
             }
-            const body = `${marker}\n**Status:** ${status}\n\nHead: \`${headSha}\``;
+            const body = `${marker}\n**Status:** ${status}\n\nHead: \`${(referenceHeadSha || '').slice(0, 7)}\``;
             // The lookup can't fail open the way the update/create below
             // can: its result picks update-vs-create, so an error swallowed
             // into "not found" doesn't lose the comment, it posts a
@@ -466,8 +517,8 @@ jobs:
             if (needsLiveHeadCheck) {
               try {
                 const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
-                if (pr.data.head.sha !== process.env.HEAD_SHA) {
-                  core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
+                if (pr.data.head.sha !== referenceHeadSha) {
+                  core.info(`PR head is now ${pr.data.head.sha}, not this run's ${referenceHeadSha} — a newer run supersedes this report. Skipping the freshness comment.`);
                   return;
                 }
               } catch (e) {
