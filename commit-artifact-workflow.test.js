@@ -281,6 +281,19 @@ test("the artifact is force-added, so a caller's .gitignore can't silently drop 
   assert.match(step("Commit and push").run, /git add -f -A -- "\$DEST_PATH"/);
 });
 
+test("dest-path is treated as a literal git pathspec, not scanned for pathspec magic", () => {
+  // `--` before a pathspec only tells git "no more options follow" — it
+  // does NOT make the pathspec's own text literal. Verified with a real
+  // repo: a directory literally named ":(exclude)**" as dest-path makes
+  // `git add -f -A -- "$DEST_PATH"` exit 0 while staging NOTHING (the
+  // magic pathspec excludes everything, with nothing else to exclude
+  // from), and the step's own "no changes" quiet-diff check then reports
+  // the artifact as never having changed — silently losing it with no
+  // error anywhere. GIT_LITERAL_PATHSPECS=1 is git's documented escape
+  // hatch; the same repro with it set stages the file correctly.
+  assert.equal(step("Commit and push").env["GIT_LITERAL_PATHSPECS"], "1");
+});
+
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
   assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);

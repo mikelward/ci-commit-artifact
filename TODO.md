@@ -44,3 +44,11 @@ has needed its own real-YAML verification round rather than a batch
 guess — see the git history of `yaml-lite.js` for the pattern. Land the
 rest together in one pass, verified against `yaml.safe_load` for each
 character, next time this file is touched for an unrelated reason.
+
+Same deferral, same reasoning: `splitFlowSequence` also doesn't reject a
+`[` or `{` appearing partway through an already-started plain element
+(`runs-on: [foo[bar]]` parses as `["foo[bar]"]` instead of being rejected —
+verified against `yaml.safe_load`, which raises a ParserError). Land this
+alongside the reserved-starter sweep above; it's the same class of gap
+(over-permissive on genuinely invalid content nobody's real workflow
+files contain), not a new investigation.

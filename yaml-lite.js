@@ -613,6 +613,25 @@ function parseWorkflowYaml(text) {
     }
   }
 
+  // A key with special meaning on Object.prototype — most notably
+  // "__proto__", a real, legal GitHub Actions job/step/input ID — cannot be
+  // set with plain `target[key] = value`: that invokes the inherited
+  // `__proto__` ACCESSOR, which reassigns the object's own prototype
+  // instead of creating an enumerable own property. The job then silently
+  // vanishes from `Object.keys(doc.jobs)` and every `for...in`/spread-based
+  // test, while `doc.jobs.__proto__` still returns it via prototype lookup
+  // — a real workflow structure the parser would otherwise represent
+  // wrong, not an out-of-scope construct to reject. Object.defineProperty
+  // sidesteps the accessor and always creates a genuine own data property,
+  // keeping the target's OWN prototype untouched (Object.create(null)
+  // would also fix this, but strips the prototype from every mapping this
+  // parser returns, breaking assert.deepEqual/deepStrictEqual — which
+  // checks prototype identity — against ordinary {} literals throughout
+  // the existing test suite).
+  function setMappingValue(target, key, value) {
+    Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+  }
+
   function parseInlineMappingItem(firstLineRest, siblingIndent, firstLineRawIndex) {
     const obj = {};
     applyMappingEntry(obj, firstLineRest, siblingIndent, firstLineRawIndex);
@@ -627,12 +646,12 @@ function parseWorkflowYaml(text) {
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(content);
       checkDuplicateKey(target, key, rawLines[rawIndex].n);
       if (isBlockScalar) {
-        target[key] = parseBlockScalar(style, chomp, ownIndent, rawIndex + 1);
+        setMappingValue(target, key, parseBlockScalar(style, chomp, ownIndent, rawIndex + 1));
       } else if (rest === "") {
         const next = peek();
-        target[key] = next && next.indent > ownIndent ? parseNode(next.indent) : null;
+        setMappingValue(target, key, next && next.indent > ownIndent ? parseNode(next.indent) : null);
       } else {
-        target[key] = parseScalar(rest);
+        setMappingValue(target, key, parseScalar(rest));
       }
     }
   }
@@ -660,12 +679,12 @@ function parseWorkflowYaml(text) {
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(line.content);
       checkDuplicateKey(obj, key, line.n);
       if (isBlockScalar) {
-        obj[key] = parseBlockScalar(style, chomp, indent, line.rawIndex + 1);
+        setMappingValue(obj, key, parseBlockScalar(style, chomp, indent, line.rawIndex + 1));
       } else if (rest === "") {
         const next = peek();
-        obj[key] = next && next.indent > indent ? parseNode(next.indent) : null;
+        setMappingValue(obj, key, next && next.indent > indent ? parseNode(next.indent) : null);
       } else {
-        obj[key] = parseScalar(rest);
+        setMappingValue(obj, key, parseScalar(rest));
       }
     }
     return obj;
