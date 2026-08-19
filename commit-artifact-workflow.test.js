@@ -745,6 +745,87 @@ test("canonicalizes dest-path before find, so an unnormalized-but-safe path does
   assert.doesNotMatch(result.output, /contains \.git entries/);
 });
 
+test("refuses to commit when the index has a stale submodule (gitlink) entry under dest-path", () => {
+  // Real Codex finding: a previously-committed submodule at dest-path
+  // leaves a mode-160000 "gitlink" index entry (a recorded commit SHA, no
+  // blob) that rm -rf + re-extract + `git add -f -A` does NOT update or
+  // replace -- verified directly with a real repo: after rm -rf and
+  // writing a real file back in its place, `git add -f -A -- "$DEST_PATH"`
+  // exits 0, `git ls-files -s` still shows the untouched 160000 entry, the
+  // real file is never staged, and `git status --short` reports NO changes
+  // at all -- a silently-uncommitted artifact with no empty-diff signal to
+  // catch it (worse: other unrelated changes in the same run would make
+  // the step "succeed" while quietly omitting this path's real content).
+  const commitStep = step("Commit and push");
+  assert.match(commitStep.run, /git ls-files -s -- "\$DEST_PATH"/);
+  // lastIndexOf for the git add call: the comment just above it (explaining
+  // this very check) also mentions the literal text 'git add -f -A --
+  // "$DEST_PATH"' in prose, earlier in the file than the real invocation.
+  const gitAddIdx = commitStep.run.lastIndexOf('git add -f -A -- "$DEST_PATH"');
+  const checkIdx = commitStep.run.indexOf('git ls-files -s -- "$DEST_PATH"');
+  assert.ok(checkIdx > -1 && checkIdx < gitAddIdx, "the gitlink check must run before git add");
+
+  const runCommit = (setupFn) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-gitlink-"));
+    try {
+      execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+      fs.mkdirSync(path.join(workspace, "out"), { recursive: true });
+      fs.writeFileSync(path.join(workspace, "out", "README.md"), "hi");
+      execFileSync("git", ["add", "out/README.md"], { cwd: workspace });
+      execFileSync("git", ["commit", "-qm", "init"], { cwd: workspace });
+      if (setupFn) setupFn(workspace);
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", commitStep.run], {
+          cwd: workspace,
+          env: {
+            ...process.env,
+            GITHUB_WORKSPACE: workspace,
+            DEST_PATH: "out/example",
+            GIT_LITERAL_PATHSPECS: "1",
+            BRANCH_REF: "x",
+            COMMIT_MESSAGE: "m",
+            EXPECTED_HEAD_SHA: "a".repeat(40),
+            GH_TOKEN: "fake",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = e.status;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+
+  const withGitlink = runCommit((ws) => {
+    execFileSync(
+      "git",
+      ["update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,out/example"],
+      { cwd: ws },
+    );
+    execFileSync("git", ["commit", "-qm", "add fake submodule"], { cwd: ws });
+    fs.mkdirSync(path.join(ws, "out", "example"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "out", "example", "real.txt"), "y");
+  });
+  assert.equal(withGitlink.code, 1, "a stale gitlink at dest-path must be rejected");
+  assert.match(withGitlink.output, /stale submodule \(gitlink\) entry/);
+
+  // Regression: a dest-path with no gitlink entry must reach past this
+  // check (it will fail later, on the push, for unrelated reasons in this
+  // sandboxed test -- what matters is it does NOT fail on the gitlink
+  // check).
+  const clean = runCommit((ws) => {
+    fs.mkdirSync(path.join(ws, "out", "example"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "out", "example", "real.txt"), "y");
+  });
+  assert.doesNotMatch(clean.output, /stale submodule \(gitlink\) entry/);
+});
+
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
   assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);
