@@ -306,6 +306,52 @@ test("rejects a tilde-prefixed dest-path before it ever reaches download-artifac
   assert.equal(midString.code, 0, "a tilde that isn't the first character must not be rejected");
 });
 
+test("rejects a dest-path with a .git component at any depth, not just at the checkout root", () => {
+  // Real Codex finding, verified directly before fixing: git refuses to
+  // track anything under a directory literally named .git anywhere in the
+  // path -- `git add -f -A -- fixtures/repo/.git` exits 0 and stages
+  // NOTHING, even with -f. The old check only rejected .git AT the
+  // checkout root, so "fixtures/repo/.git" would pass validation, get
+  // emptied and re-downloaded into just fine, and then the "Commit and
+  // push" step's `git add -f -A` would silently stage none of it -- the
+  // run would report committed=false as if there was nothing to commit,
+  // when really the artifact landed on disk and never made it into git.
+  const clearStep = step("Empty the destination before extracting the artifact");
+  assert.match(
+    clearStep.run,
+    /"\$GITHUB_WORKSPACE"\/\*\/\.git\|"\$GITHUB_WORKSPACE"\/\*\/\.git\/\*/,
+    "should reject a .git component at any depth, not just the root",
+  );
+
+  const runClear = (destPath) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "nested-git-reject-"));
+    try {
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", clearStep.run], {
+          cwd: workspace,
+          env: { ...process.env, GITHUB_WORKSPACE: workspace, DEST_PATH: destPath },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = typeof e.status === "number" ? e.status : 1;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+  const oneLevel = runClear("fixtures/repo/.git");
+  assert.equal(oneLevel.code, 1, "a .git one level down must be rejected");
+  assert.match(oneLevel.output, /resolves through a \.git directory/);
+  const deeper = runClear("a/b/c/.git/hooks");
+  assert.equal(deeper.code, 1, "a .git several levels down must be rejected");
+  // Regressions: a name that merely LOOKS like .git must still be allowed.
+  assert.equal(runClear("foo.gitignore").code, 0, "a .gitignore-like name must not be rejected");
+  assert.equal(runClear("build.git-output").code, 0, "a name containing .git- must not be rejected");
+});
+
 test("refuses to rm -rf a dest-path that resolves through a symlink, direct or intermediate", () => {
   // Real gap, found by Codex review and verified against a real filesystem
   // before this test was written: realpath -m follows symlinks in every
