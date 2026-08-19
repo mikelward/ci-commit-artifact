@@ -463,6 +463,24 @@ jobs:
             echo "$git_entries" | sed 's/^/::error::  /'
             exit 1
           fi
+          # A previously-committed submodule at dest-path leaves a mode-160000
+          # "gitlink" index entry (a recorded commit SHA, no blob) that the
+          # rm -rf + re-extract + `git add -f -A` sequence below does NOT
+          # update or replace: verified directly — after rm -rf and writing a
+          # real file back in its place, `git add -f -A -- "$DEST_PATH"`
+          # exits 0, `git ls-files -s` still shows the untouched 160000
+          # entry, the real file is never staged, and `git diff --cached
+          # --quiet` / `git status --short` report no changes at all. Under
+          # this workflow's contract dest-path holds nothing but generated
+          # artifact content, wiped and replaced every run, so a gitlink
+          # there is always stale, never a legitimate configuration to defer
+          # to silently.
+          gitlink_entries=$(git ls-files -s -- "$DEST_PATH" | awk '$1 == "160000"')
+          if [ -n "$gitlink_entries" ]; then
+            echo "::error::the index has a stale submodule (gitlink) entry under $DEST_PATH that rm -rf + git add -f does not update or replace:"
+            echo "$gitlink_entries" | sed 's/^/::error::  /'
+            exit 1
+          fi
           # -f (force): dest-path was rm -rf'd and freshly re-extracted from
           # the artifact above, so everything under it right now IS the
           # artifact's own content — not a mix where a caller's .gitignore
