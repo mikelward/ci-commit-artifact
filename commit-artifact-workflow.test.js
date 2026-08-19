@@ -294,6 +294,32 @@ test("the SKIPPED (branch-moved) case is checked before DOWNLOAD_OUTCOME in the 
   assert.ok(skippedIdx < downloadCheckIdx);
 });
 
+test("the freshness comment re-checks the PR's live head before writing, and skips on a mismatch", () => {
+  // Overlapping runs are expected (cancel-in-progress is asynchronous), so
+  // an older run can reach this step after a newer run already posted an
+  // accurate status. Without re-confirming the PR's head is still what this
+  // run's own HEAD_SHA is about, whichever run's write happens to land LAST
+  // wins — even a stale "branch advanced"/"download failed"/"commit failed"
+  // overwriting a fresh, accurate comment, with no further push coming to
+  // correct it.
+  const script = step("Comment freshness on the PR").with.script;
+  const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
+  const mismatchIdx = script.indexOf("pr.data.head.sha !== process.env.HEAD_SHA");
+  const updateIdx = script.indexOf("github.rest.issues.updateComment(");
+  const createIdx = script.indexOf("github.rest.issues.createComment(");
+  assert.ok(pullsGetIdx > -1, "no live-head re-fetch found in the freshness script");
+  assert.ok(mismatchIdx > -1, "no HEAD_SHA mismatch check found in the freshness script");
+  assert.ok(updateIdx > -1 && createIdx > -1);
+  assert.ok(
+    pullsGetIdx < mismatchIdx && mismatchIdx < updateIdx && mismatchIdx < createIdx,
+    "the live-head check must run, and be evaluated, before either comment-write call — or a stale run could still overwrite a fresher one",
+  );
+  // Never spliced directly into the run: block — same injection concern as
+  // every other PR-influenced value in this file (see the sibling test
+  // above), so this must reach the script only via `process.env`.
+  assert.match(script, /await github\.rest\.pulls\.get\(\{ \.\.\.context\.repo, pull_number: prNumber \}\)/);
+});
+
 test("checkout/guard/clear failing before the download step is checked reports distinctly, first in the chain", () => {
   // checkout, guard, and clear all run unconditionally (or run whenever
   // guard itself succeeded) ahead of the download step — a non-success

@@ -320,6 +320,35 @@ jobs:
             const marker = process.env.COMMENT_MARKER;
             const noun = process.env.ARTIFACT_NOUN;
             const headSha = (process.env.HEAD_SHA || '').slice(0, 7);
+            const prNumber = Number(process.env.PR_NUMBER);
+
+            // Overlapping runs are expected here — expected-head-sha's own
+            // description above notes cancel-in-progress is asynchronous —
+            // so an older run can still reach this step after a newer run,
+            // triggered by a later push, already posted its own accurate
+            // status. Without this check, whichever run's comment step
+            // happens to finish LAST wins even when it's reporting on a push
+            // that is no longer the PR's head, and nothing ever corrects a
+            // stale "branch advanced"/"download failed"/"commit failed"
+            // status left behind that way — there's no further push coming
+            // to trigger a fixing run. Re-fetching the PR's live head right
+            // before writing and comparing it to what THIS run's status is
+            // actually about (HEAD_SHA: this run's own new commit if it made
+            // one, else the head it found the branch at) catches that: a
+            // mismatch means some other run's dispatch has since landed and
+            // this report is already superseded, so skip rather than risk
+            // downgrading a fresher, accurate comment.
+            try {
+              const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+              if (pr.data.head.sha !== process.env.HEAD_SHA) {
+                core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
+                return;
+              }
+            } catch (e) {
+              core.warning(`Could not confirm the PR's current head (${e.message}); skipping the freshness comment rather than risking overwriting a newer, accurate one.`);
+              return;
+            }
+
             let status;
             // checkout/guard/clear all run unconditionally (or nearly so —
             // guard has no if: at all, clear only requires guard to have
@@ -353,7 +382,6 @@ jobs:
               status = `✅ ${noun}s up-to-date — no changes from this push.`;
             }
             const body = `${marker}\n**Status:** ${status}\n\nHead: \`${headSha}\``;
-            const prNumber = Number(process.env.PR_NUMBER);
             // The lookup can't fail open the way the update/create below
             // can: its result picks update-vs-create, so an error swallowed
             // into "not found" doesn't lose the comment, it posts a
