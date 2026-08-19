@@ -295,6 +295,47 @@ test("throws on a block scalar line that dedents below the block's own indent wi
   assert.throws(() => parseWorkflowYaml("a: |\n    x\n  y\nb: 1\n"));
 });
 
+test("throws on an unterminated flow sequence, rather than returning the malformed text as a plain string", () => {
+  // "runs-on: [ubuntu-latest" (no closing ]) previously fell through to
+  // parseScalar's final `return s`, silently returning the literal string
+  // "[ubuntu-latest" instead of raising. Verified against
+  // yaml.safe_load("runs-on: [ubuntu-latest\n"), which raises a
+  // ParserError ("expected ',' or ']', but got <stream end>") — GitHub's
+  // own parser rejects this workflow outright.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest\n"),
+    /unterminated flow sequence/,
+  );
+  // A valid, fully-closed flow sequence must still parse.
+  const doc = parseWorkflowYaml("runs-on: [ubuntu-latest]\n");
+  assert.deepEqual(doc["runs-on"], ["ubuntu-latest"]);
+});
+
+test("throws on a tab in a line's indentation, including when the tab is the line's very FIRST character", () => {
+  // The original tab check computed indent by matching only leading SPACES
+  // (raw.replace(/^ */, "")), so a line whose indentation is a tab from its
+  // very first character matched zero leading spaces — indent came out 0,
+  // and the check then tab-tested raw.slice(0, 0), always "". The check
+  // was unreachable for exactly the case it existed to catch. Verified
+  // against yaml.safe_load("a:\n\tb: c\n"), which raises a ScannerError
+  // ("found character '\\t' that cannot start any token") rather than
+  // accepting it as two top-level keys (the old bug's actual result).
+  assert.throws(
+    () => parseWorkflowYaml("a:\n\tb: c\n"),
+    /tab in indentation/,
+  );
+  // A tab AFTER some leading spaces must be caught too — checked directly
+  // rather than assumed, since it turns out the ORIGINAL (broken) check
+  // missed this shape as well: raw.replace(/^ */, "") matches only the
+  // leading spaces and stops at the tab, so raw.slice(0, indent) never
+  // included the tab there either. Both shapes were broken; this fix
+  // closes both.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  \tb: c\n"),
+    /tab in indentation/,
+  );
+});
+
 test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
   // `name: "example` (no closing quote) previously fell through every
   // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since

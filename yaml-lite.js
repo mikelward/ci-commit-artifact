@@ -46,10 +46,20 @@ function parseWorkflowYaml(text) {
   // whether a given line sits inside a block scalar, was this parser's
   // first real bug — caught by round-tripping this repo's own workflow.
   const rawLines = body.split("\n").map((raw, i) => {
-    const indent = raw.length - raw.replace(/^ */, "").length;
-    if (/\t/.test(raw.slice(0, indent))) {
+    // Leading whitespace scanned as SPACES-OR-TABS first, tabs checked
+    // against that — not raw.replace(/^ */, "") followed by checking
+    // raw.slice(0, indent) for a tab, which made the check unreachable for
+    // the exact case it exists to catch: a line whose indentation is a tab
+    // from its very first character matches zero leading spaces, so indent
+    // was computed as 0 and the slice it then tab-checked was always "".
+    // Verified against yaml.safe_load("a:\n\tb: c\n"), which raises a
+    // ScannerError ("found character '\t' that cannot start any token")
+    // rather than accepting it as two top-level keys.
+    const leadingWhitespace = raw.match(/^[ \t]*/)[0];
+    if (leadingWhitespace.includes("\t")) {
       throw new Error(`yaml-lite: tab in indentation at line ${i + 1} — not supported`);
     }
+    const indent = leadingWhitespace.length;
     const trimmed = raw.trim();
     return {
       n: i + 1,
@@ -158,7 +168,16 @@ function parseWorkflowYaml(text) {
     if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
       return JSON.parse(s);
     }
-    if (s.startsWith("[") && s.endsWith("]")) {
+    if (s.startsWith("[")) {
+      // An unmatched opening bracket ("runs-on: [ubuntu-latest", no closing
+      // "]") previously fell through to the plain-scalar return below,
+      // silently returning the literal text "[ubuntu-latest" instead of
+      // rejecting it — verified against yaml.safe_load, which raises a
+      // ParserError ("expected ',' or ']', but got <stream end>") rather
+      // than returning a value.
+      if (!s.endsWith("]")) {
+        throw new Error(`yaml-lite: unterminated flow sequence (got ${JSON.stringify(s)})`);
+      }
       const inner = s.slice(1, -1).trim();
       if (inner === "") return [];
       return splitFlowSequence(inner).map(parseScalar);
