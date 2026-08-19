@@ -633,6 +633,35 @@ test("does not false-positive on same-named keys at different nesting levels", (
   assert.equal(doc.other.contents, "write");
 });
 
+test("preserves __proto__ as a real, enumerable own mapping key — a legal job/step ID, not a JS prototype slot", () => {
+  // A plain `target[key] = value` assignment where key is "__proto__"
+  // invokes the inherited __proto__ ACCESSOR instead of creating an own
+  // property, reassigning the object's own prototype rather than storing
+  // the value — so "jobs.__proto__:" (a real, legal GitHub Actions job ID)
+  // silently vanished from Object.keys(doc.jobs) and any for...in/spread,
+  // while doc.jobs.__proto__ still returned it via prototype lookup. Not
+  // an out-of-scope construct to reject: this is a real workflow shape the
+  // parser represented WRONG.
+  const doc = parseWorkflowYaml("jobs:\n  __proto__:\n    runs-on: ubuntu-latest\n  real:\n    runs-on: ubuntu-latest\n");
+  assert.deepEqual(Object.keys(doc.jobs).sort(), ["__proto__", "real"]);
+  assert.ok(Object.prototype.hasOwnProperty.call(doc.jobs, "__proto__"));
+  assert.equal(doc.jobs.__proto__["runs-on"], "ubuntu-latest");
+  // The FIX (Object.defineProperty) must not itself change what a mapping
+  // OBJECT's own prototype is — Object.create(null) would also solve the
+  // enumeration problem, but at the cost of breaking assert.deepEqual
+  // against ordinary {} literals everywhere else in this suite, since
+  // deepEqual checks prototype identity too.
+  assert.equal(Object.getPrototypeOf(doc.jobs), Object.prototype);
+  assert.deepEqual(doc.jobs.real, { "runs-on": "ubuntu-latest" });
+});
+
+test("still catches a duplicate __proto__ key, the same as any other key", () => {
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  __proto__: 1\n  __proto__: 2\n"),
+    /duplicate mapping key "__proto__"/,
+  );
+});
+
 test("round-trips this repository's own commit-artifact.yml without throwing", () => {
   const yamlPath = path.join(
     __dirname,

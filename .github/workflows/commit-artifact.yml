@@ -302,6 +302,20 @@ jobs:
           DEST_PATH: ${{ inputs.dest-path }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+          # `--` before a pathspec only tells git "no more options follow" —
+          # it does NOT make the pathspec's own text literal. A dest-path a
+          # caller literally names with git's pathspec magic syntax (e.g.
+          # ":(exclude)**") is still parsed as magic even past `--`,
+          # verified with a real repo: `git add -f -A -- ':(exclude)**'`
+          # exits 0 and stages nothing (":(exclude)**" excludes everything,
+          # with nothing else to exclude FROM), and the quiet `git diff
+          # --cached --quiet` check just below then reports "No changes" —
+          # exactly the silently-uncommitted-artifact failure this step's
+          # own `-f` comment already guards a different version of.
+          # GIT_LITERAL_PATHSPECS=1 is git's own documented escape hatch:
+          # every pathspec for the rest of this step is treated as a plain
+          # string, verified to turn the same repro into a real staged file.
+          GIT_LITERAL_PATHSPECS: "1"
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
