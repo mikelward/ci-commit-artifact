@@ -295,6 +295,46 @@ test("throws on a block scalar line that dedents below the block's own indent wi
   assert.throws(() => parseWorkflowYaml("a: |\n    x\n  y\nb: 1\n"));
 });
 
+test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
+  // `name: "example` (no closing quote) previously fell through every
+  // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since
+  // it doesn't end with a quote at all — and returned the literal text
+  // `"example`, quote character included, as an ordinary plain scalar.
+  // Verified against yaml.safe_load('name: "example\n'), which raises a
+  // ScannerError ("unexpected end of stream") rather than returning a
+  // value: GitHub's own parser rejects this workflow outright, so silently
+  // parsing it here would let a structural test stay green against YAML
+  // that can't actually run.
+  assert.throws(
+    () => parseWorkflowYaml('a: "example\n'),
+    /unterminated quoted scalar/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: 'example\n"),
+    /unterminated quoted scalar/,
+  );
+});
+
+test("throws on an unterminated quoted scalar inside a flow sequence too, not just as a bare value", () => {
+  // splitFlowSequence hands each element to the same parseScalar the bare-
+  // value case above exercises, so an unterminated quote reachable only
+  // through a flow-sequence element ('a: ["b, c]') needs its own case:
+  // fixing only the bare-value path would leave this one silently wrong.
+  assert.throws(
+    () => parseWorkflowYaml('a: ["b, c]\n'),
+    /unterminated quoted scalar/,
+  );
+});
+
+test("does not false-positive on a validly-quoted scalar whose content happens to end in an escaped quote", () => {
+  // A double-quoted scalar ending `\"` immediately before the real closing
+  // quote (`"a\""` — content is a literal `a"`) must still parse: the
+  // escaped quote is content, not the terminator, and the REAL terminator
+  // is the character after it.
+  const doc = parseWorkflowYaml('a: "a\\""\n');
+  assert.equal(doc.a, 'a"');
+});
+
 test("round-trips this repository's own commit-artifact.yml without throwing", () => {
   const yamlPath = path.join(
     __dirname,

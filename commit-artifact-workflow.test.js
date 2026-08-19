@@ -238,6 +238,17 @@ test("the github-script body never splices a ${{ inputs.* }} or ${{ steps.* }} e
   );
 });
 
+test("the artifact is force-added, so a caller's .gitignore can't silently drop new content", () => {
+  // dest-path was rm -rf'd and freshly re-extracted from the artifact just
+  // above this step, so everything under it right now IS the artifact's own
+  // content. A plain `git add -A` silently skips a new file that matches a
+  // caller's .gitignore (verified: an untracked, gitignored file under
+  // dest-path is left out of the index entirely by `git add -A` alone) —
+  // the commit would then succeed while quietly omitting real content, with
+  // nothing anywhere reporting it. -f overrides that.
+  assert.match(step("Commit and push").run, /git add -f -A -- "\$DEST_PATH"/);
+});
+
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
   assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);

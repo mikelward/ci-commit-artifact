@@ -276,7 +276,16 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A -- "$DEST_PATH"
+          # -f (force): dest-path was rm -rf'd and freshly re-extracted from
+          # the artifact above, so everything under it right now IS the
+          # artifact's own content — not a mix where a caller's .gitignore
+          # (say, a blanket *.png rule) might be deliberately excluding part
+          # of it. Without -f, `git add -A` silently skips a new file that
+          # matches .gitignore — verified: an untracked, gitignored file
+          # under dest-path is left out of the index entirely, so the commit
+          # below would succeed while quietly omitting real artifact content,
+          # with nothing anywhere saying so.
+          git add -f -A -- "$DEST_PATH"
           if git diff --cached --quiet; then
             echo "No changes under $DEST_PATH."
             echo "committed=false" >> "$GITHUB_OUTPUT"
