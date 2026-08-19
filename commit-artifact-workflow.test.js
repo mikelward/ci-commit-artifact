@@ -561,26 +561,31 @@ test("refuses to commit an artifact that itself contains a .git entry", () => {
   // "nothing staged" case dest-path's own .git check guards, since
   // there's no empty-diff signal here to catch it.
   const commitStep = step("Commit and push");
-  assert.match(commitStep.run, /find "\$DEST_PATH" -name \.git/);
+  assert.match(commitStep.run, /find "\$GITHUB_WORKSPACE\/\$DEST_PATH" -name \.git/);
   const gitAddIdx = commitStep.run.indexOf('git add -f -A -- "$DEST_PATH"');
-  const checkIdx = commitStep.run.indexOf('find "$DEST_PATH" -name .git');
+  const checkIdx = commitStep.run.indexOf('find "$GITHUB_WORKSPACE/$DEST_PATH" -name .git');
   assert.ok(gitAddIdx > -1, "the actual git add -f -A invocation should exist");
   assert.ok(checkIdx > -1 && checkIdx < gitAddIdx, "the .git-entry check must run before git add");
 
-  const runCommit = (setupFn) => {
+  const runCommit = (destPath, setupFn) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-git-entry-"));
     try {
       execFileSync("git", ["init", "-q", "."], { cwd: workspace });
       execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
       execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
-      setupFn(workspace);
+      // A canary the -delete finding (below) would wipe out if the fix
+      // regressed back to passing find an unprefixed, dash-swallowable path.
+      fs.mkdirSync(path.join(workspace, "canary"), { recursive: true });
+      fs.writeFileSync(path.join(workspace, "canary", "important.txt"), "must survive");
+      if (setupFn) setupFn(workspace);
       const result = { code: 0, output: "" };
       try {
         result.output = execFileSync("bash", ["-c", commitStep.run], {
           cwd: workspace,
           env: {
             ...process.env,
-            DEST_PATH: "out/example",
+            GITHUB_WORKSPACE: workspace,
+            DEST_PATH: destPath,
             GIT_LITERAL_PATHSPECS: "1",
             BRANCH_REF: "x",
             COMMIT_MESSAGE: "m",
@@ -593,13 +598,14 @@ test("refuses to commit an artifact that itself contains a .git entry", () => {
         result.code = e.status;
         result.output = String(e.stdout || "") + String(e.stderr || "");
       }
+      result.canarySurvived = fs.existsSync(path.join(workspace, "canary", "important.txt"));
       return result;
     } finally {
       fs.rmSync(workspace, { recursive: true, force: true });
     }
   };
 
-  const withGitDir = runCommit((ws) => {
+  const withGitDir = runCommit("out/example", (ws) => {
     fs.mkdirSync(path.join(ws, "out/example/.git"), { recursive: true });
     fs.writeFileSync(path.join(ws, "out/example/.git/config"), "x");
     fs.writeFileSync(path.join(ws, "out/example/real.txt"), "y");
@@ -610,11 +616,69 @@ test("refuses to commit an artifact that itself contains a .git entry", () => {
   // Regression: an artifact with no .git entries must reach past this
   // check (it will fail later, on the push, for unrelated reasons in this
   // sandboxed test -- what matters is it does NOT fail on the .git check).
-  const clean = runCommit((ws) => {
+  const clean = runCommit("out/example", (ws) => {
     fs.mkdirSync(path.join(ws, "out/example"), { recursive: true });
     fs.writeFileSync(path.join(ws, "out/example/real.txt"), "y");
   });
   assert.doesNotMatch(clean.output, /contains \.git entries/);
+});
+
+test("passes find an absolute path, so a dest-path find would parse as an expression can't turn destructive", () => {
+  // Real, SEVERE Codex finding on the .git-entry check above: find's
+  // syntax is `find [path...] [expression]`, deciding "path" vs
+  // "expression" by whether an argument starts with '-' -- with no `--`
+  // escape hatch. A dest-path like "-delete" (already validated as a
+  // safe relative path by the earlier checks -- nothing rejects a
+  // leading '-') made find read it as the primary `-delete` instead of a
+  // path, defaulting the search root to '.' (this step's cwd, the
+  // checkout root) and deleting every file found there. Verified
+  // directly against a real filesystem before fixing: bare `find
+  // "-delete" -name .git` recursively deleted an entire populated
+  // directory tree. Prefixing with $GITHUB_WORKSPACE guarantees the
+  // argument always starts with '/', which find can never parse as an
+  // expression.
+  const commitStep = step("Commit and push");
+
+  const runCommit = (destPath) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "find-dash-safety-"));
+    try {
+      execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+      fs.mkdirSync(path.join(workspace, "canary"), { recursive: true });
+      fs.writeFileSync(path.join(workspace, "canary", "important.txt"), "must survive");
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", commitStep.run], {
+          cwd: workspace,
+          env: {
+            ...process.env,
+            GITHUB_WORKSPACE: workspace,
+            DEST_PATH: destPath,
+            GIT_LITERAL_PATHSPECS: "1",
+            BRANCH_REF: "x",
+            COMMIT_MESSAGE: "m",
+            EXPECTED_HEAD_SHA: "a".repeat(40),
+            GH_TOKEN: "fake",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = e.status;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      result.canarySurvived = fs.existsSync(path.join(workspace, "canary", "important.txt"));
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+
+  const deleteAttempt = runCommit("-delete");
+  assert.ok(
+    deleteAttempt.canarySurvived,
+    "a dest-path of '-delete' must never let find delete anything outside the intended destination",
+  );
 });
 
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
