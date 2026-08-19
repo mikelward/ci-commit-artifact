@@ -286,10 +286,18 @@ function parseWorkflowYaml(text) {
     // exactly one trailing "\n" regardless of the source — clip shares
     // keep's EOF-awareness: `a: |\n  x` with no final source newline at all
     // (the block is the last thing in the document) clips to "x", not
-    // "x\n". A block scalar with NO content at all (e.g. `a: |` immediately
-    // followed by a sibling key) stays "" either way.
-    if (literal === "") return "";
-    return literal.replace(/\n*$/, "") + (sourceEndsWithNewline ? "\n" : "");
+    // "x\n". Stripping trailing newlines FIRST, then testing for emptiness,
+    // covers both "no content lines at all" (`a: |` with a sibling key right
+    // after — collected.length === 0, literal === "" already) and "content
+    // lines that are all blank" (`a: |\n\n` — collected.length === 1 but the
+    // one collected line is "", so literal is "\n" going in, not ""): both
+    // clip to "", verified against yaml.safe_load(\"a: |\\n\\n\") ->
+    // {'a': ''}, not {'a': '\\n'}. The second case was missed on the first
+    // pass, which only tested `literal === ""` directly and let a blank-only
+    // scalar's newline survive the clip.
+    const stripped = literal.replace(/\n*$/, "");
+    if (stripped === "") return "";
+    return stripped + (sourceEndsWithNewline ? "\n" : "");
   }
 
   function parseNode(indent) {
