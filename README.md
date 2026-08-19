@@ -31,11 +31,13 @@ the artifact:
 ```yaml
 jobs:
   render:
-    # ... runs PR-controlled code, renders app/snapshots/, uploads it:
-    - uses: actions/upload-artifact@v7
-      with:
-        name: my-artifact
-        path: app/snapshots/
+    runs-on: ubuntu-latest
+    steps:
+      # ... runs PR-controlled code, renders app/snapshots/, then:
+      - uses: actions/upload-artifact@v7
+        with:
+          name: my-artifact
+          path: app/snapshots/
 
   commit:
     needs: render
