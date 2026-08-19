@@ -147,6 +147,7 @@ test("fails fast on an empty branch-ref, before checkout can silently fall back"
       execFileSync("bash", ["-c", validate.run], {
         env: {
           ...process.env,
+          ARTIFACT_NAME: "ui-snapshots",
           BRANCH_REF: branchRef,
           EXPECTED_HEAD_SHA: "a".repeat(40),
           PR_NUMBER: "",
@@ -164,6 +165,44 @@ test("fails fast on an empty branch-ref, before checkout can silently fall back"
   assert.equal(empty.code, 1, "an empty branch-ref must be rejected");
   assert.match(empty.output, /branch-ref is ''/);
   assert.equal(runCase("feature/some-branch").code, 0, "a real branch-ref must not be rejected");
+});
+
+test("fails fast on an empty artifact-name, before download-artifact can silently download everything", () => {
+  // Real Codex finding, verified against actions/download-artifact's own
+  // source before fixing: `const isSingleArtifactDownload = !!inputs.name`
+  // treats an empty string exactly like an omitted input, so it falls into
+  // the "download every artifact in the run" path instead of failing on a
+  // name that doesn't exist. Same underlying shape as branch-ref and
+  // expected-head-sha: required: true only checks the caller supplied the
+  // KEY, not that its value is non-empty.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.equal(validate.env.ARTIFACT_NAME, "${{ inputs.artifact-name }}");
+  assert.match(validate.run, /\[ -z "\$ARTIFACT_NAME" \]/);
+
+  const runCase = (artifactName) => {
+    try {
+      execFileSync("bash", ["-c", validate.run], {
+        env: {
+          ...process.env,
+          ARTIFACT_NAME: artifactName,
+          BRANCH_REF: "feature/some-branch",
+          EXPECTED_HEAD_SHA: "a".repeat(40),
+          PR_NUMBER: "",
+          COMMENT_MARKER: "",
+          DISPATCH_WORKFLOW: "",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { code: 0 };
+    } catch (e) {
+      return { code: e.status, output: String(e.stdout) + String(e.stderr) };
+    }
+  };
+  const empty = runCase("");
+  assert.equal(empty.code, 1, "an empty artifact-name must be rejected");
+  assert.match(empty.output, /artifact-name is ''/);
+  assert.equal(runCase("ui-snapshots").code, 0, "a real artifact-name must not be rejected");
 });
 
 test("fails fast on an expected-head-sha that isn't a real full commit SHA", () => {
@@ -219,6 +258,52 @@ test("refuses to rm -rf a dest-path that isn't a safe relative path inside the c
   // Verified with a real filesystem before fixing.
   assert.match(clearStep.run, /rm -rf -- "\$resolved"/);
   assert.doesNotMatch(clearStep.run, /rm -rf -- "\$DEST_PATH"/);
+});
+
+test("rejects a tilde-prefixed dest-path before it ever reaches download-artifact", () => {
+  // Real Codex finding, verified against actions/download-artifact's own
+  // source before fixing: this step's `realpath -m` never expands a
+  // leading '~' (it's a plain canonicalizer, not a shell), so "~/foo"
+  // validates HERE as the literal, harmless subdirectory
+  // $GITHUB_WORKSPACE/~/foo — but the download step hands the RAW,
+  // unvalidated dest-path string to actions/download-artifact's `path:`
+  // input, whose own code (`if (inputs.path.startsWith('~')) inputs.path =
+  // inputs.path.replace('~', os.homedir())`) expands it to the runner's
+  // real home directory. What gets validated and what actually receives
+  // the artifact would silently be two different paths.
+  const clearStep = step("Empty the destination before extracting the artifact");
+  assert.match(clearStep.run, /"~"\|"~"\/\*/, "should reject a bare or slash-prefixed tilde");
+
+  const runClear = (destPath) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "tilde-reject-"));
+    try {
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", clearStep.run], {
+          cwd: workspace,
+          env: { ...process.env, GITHUB_WORKSPACE: workspace, DEST_PATH: destPath },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = typeof e.status === "number" ? e.status : 1;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+  const bare = runClear("~");
+  assert.equal(bare.code, 1, "a bare '~' must be rejected");
+  assert.match(bare.output, /dest-path must be a non-empty path/);
+  const prefixed = runClear("~/evil");
+  assert.equal(prefixed.code, 1, "a '~/...' dest-path must be rejected");
+  assert.match(prefixed.output, /dest-path must be a non-empty path/);
+  // Regression: a tilde NOT at the very start is not expanded by
+  // download-artifact's own check (a plain `startsWith('~')`), so it must
+  // not be rejected here either.
+  const midString = runClear("safe/~evil");
+  assert.equal(midString.code, 0, "a tilde that isn't the first character must not be rejected");
 });
 
 test("refuses to rm -rf a dest-path that resolves through a symlink, direct or intermediate", () => {
