@@ -304,9 +304,19 @@ function parseWorkflowYaml(text) {
   // final character). Quote-aware — the same reason splitFlowSequence and
   // stripInlineComment are: a bracket character inside a quoted element
   // ("[\"a]b\"]") is content, not a delimiter, so it must not be counted.
+  // `elementStart` restricts quote-opening to an element's OWN first
+  // character, same rule and same reason as splitFlowSequence's
+  // `current.trim() === ""` guard: without it, this function previously
+  // entered quote mode for ANY quote character anywhere, so
+  // "[echo \"x]y\", q]" swallowed the real closing "]" right after "x"
+  // into a synthetic quote run and read the whole thing as balanced —
+  // verified against yaml.safe_load, which rejects it outright. `[` and
+  // `,` both start a fresh element (nested or sibling); any non-whitespace
+  // character ends "start of element".
   function hasBalancedFlowBrackets(s) {
     let depth = 0;
     let quote = null;
+    let elementStart = true;
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
       if (quote) {
@@ -323,17 +333,28 @@ function parseWorkflowYaml(text) {
         }
         continue;
       }
-      if (ch === "'" || ch === '"') {
+      if ((ch === "'" || ch === '"') && elementStart) {
         quote = ch;
+        elementStart = false;
         continue;
       }
       if (ch === "[") {
         depth++;
-      } else if (ch === "]") {
+        elementStart = true;
+        continue;
+      }
+      if (ch === "]") {
         depth--;
+        elementStart = false;
         if (depth < 0) return false;
         if (depth === 0) return i === s.length - 1;
+        continue;
       }
+      if (ch === ",") {
+        elementStart = true;
+        continue;
+      }
+      if (!/\s/.test(ch)) elementStart = false;
     }
     // A quote still open at the string's end ('a: ["b, c]') is a
     // different, more specific defect — an unterminated quoted scalar —
