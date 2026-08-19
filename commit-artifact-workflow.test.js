@@ -561,9 +561,10 @@ test("refuses to commit an artifact that itself contains a .git entry", () => {
   // "nothing staged" case dest-path's own .git check guards, since
   // there's no empty-diff signal here to catch it.
   const commitStep = step("Commit and push");
-  assert.match(commitStep.run, /find "\$GITHUB_WORKSPACE\/\$DEST_PATH" -name \.git/);
+  assert.match(commitStep.run, /realpath -m -- "\$GITHUB_WORKSPACE\/\$DEST_PATH"/);
+  assert.match(commitStep.run, /find "\$resolved_dest" -name \.git/);
   const gitAddIdx = commitStep.run.indexOf('git add -f -A -- "$DEST_PATH"');
-  const checkIdx = commitStep.run.indexOf('find "$GITHUB_WORKSPACE/$DEST_PATH" -name .git');
+  const checkIdx = commitStep.run.indexOf('find "$resolved_dest" -name .git');
   assert.ok(gitAddIdx > -1, "the actual git add -f -A invocation should exist");
   assert.ok(checkIdx > -1 && checkIdx < gitAddIdx, "the .git-entry check must run before git add");
 
@@ -679,6 +680,69 @@ test("passes find an absolute path, so a dest-path find would parse as an expres
     deleteAttempt.canarySurvived,
     "a dest-path of '-delete' must never let find delete anything outside the intended destination",
   );
+});
+
+test("canonicalizes dest-path before find, so an unnormalized-but-safe path doesn't abort a valid commit", () => {
+  // Real Codex finding on the absolute-path fix above: a dest-path like
+  // "missing/../snapshots" is an accepted shape -- it already resolves
+  // safely inside the checkout, same as the "Empty the destination"
+  // step's own already-handled case -- but "missing" never actually
+  // exists on disk. git add and actions/download-artifact both handle
+  // this fine because both resolve '..' lexically before touching the
+  // filesystem (verified against the action's own source: it calls
+  // path.resolve(inputs.path) before creating anything, so "missing" is
+  // never created; and `git add -f -A -- "missing/../snapshots"` stages
+  // correctly with no such directory needed) -- but a bare
+  // $GITHUB_WORKSPACE/$DEST_PATH concatenation isn't lexical, so find
+  // needs "missing" to be a real, traversable directory and fails
+  // closed with "No such file or directory", aborting an otherwise
+  // completely valid commit under set -e. realpath -m collapses '..'
+  // the same lexical way, without needing "missing" to exist.
+  const commitStep = step("Commit and push");
+
+  const runCommit = (destPath, setupFn) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "dotdot-safety-"));
+    try {
+      execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+      if (setupFn) setupFn(workspace);
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", commitStep.run], {
+          cwd: workspace,
+          env: {
+            ...process.env,
+            GITHUB_WORKSPACE: workspace,
+            DEST_PATH: destPath,
+            GIT_LITERAL_PATHSPECS: "1",
+            BRANCH_REF: "x",
+            COMMIT_MESSAGE: "m",
+            EXPECTED_HEAD_SHA: "a".repeat(40),
+            GH_TOKEN: "fake",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = e.status;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+
+  const result = runCommit("missing/../snapshots", (ws) => {
+    fs.mkdirSync(path.join(ws, "snapshots"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "snapshots", "real.txt"), "y");
+  });
+  assert.doesNotMatch(
+    result.output,
+    /No such file or directory/,
+    "an unnormalized-but-safe dest-path must not make find abort the step",
+  );
+  assert.doesNotMatch(result.output, /contains \.git entries/);
 });
 
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
