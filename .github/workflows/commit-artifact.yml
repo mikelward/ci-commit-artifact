@@ -313,8 +313,24 @@ jobs:
           case "$resolved" in
             "$GITHUB_WORKSPACE")
               echo "::error::dest-path resolves to the checkout root ($resolved) — refusing to delete it"; exit 1 ;;
-            "$GITHUB_WORKSPACE"/.git|"$GITHUB_WORKSPACE"/.git/*)
-              echo "::error::dest-path resolves inside .git ($resolved) — refusing to delete it"; exit 1 ;;
+            # Any '.git' path COMPONENT, not just at the checkout root: git
+            # itself refuses to track anything under a directory literally
+            # named .git anywhere in the path, even with `git add -f`, and
+            # does so with exit 0 and nothing staged — no error, just
+            # silence. Verified directly: `git add -f -A --
+            # fixtures/repo/.git` after populating that directory stages
+            # nothing at all. A dest-path like "fixtures/repo/.git" would
+            # pass the old root-only check, get emptied and re-downloaded
+            # into here just fine, and then the "Commit and push" step's
+            # `git add -f -A` would silently stage none of it — the run
+            # reports committed=false as if there was nothing to commit,
+            # when really the artifact landed on disk and just never made
+            # it into git. `*` in a case pattern matches across `/`, so a
+            # single `*/.git` alternative catches .git at any depth, not
+            # just one level down (verified against a: b: c: .git and
+            # deeper).
+            "$GITHUB_WORKSPACE"/.git|"$GITHUB_WORKSPACE"/.git/*|"$GITHUB_WORKSPACE"/*/.git|"$GITHUB_WORKSPACE"/*/.git/*)
+              echo "::error::dest-path resolves through a .git directory ($resolved) — git would silently refuse to track anything under it, even with -f"; exit 1 ;;
             "$GITHUB_WORKSPACE"/*)
               : ;;
             *)
