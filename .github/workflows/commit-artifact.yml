@@ -149,6 +149,17 @@ jobs:
         # GitHub's git backend is SHA-1 today (40 lowercase hex chars); this
         # doesn't attempt to anticipate a future SHA-256 migration.
         #
+        # branch-ref needs the same treatment, for the same underlying
+        # reason and a distinct downstream failure mode: actions/checkout
+        # treats an empty `ref:` as unset and silently falls back to the
+        # triggering event's own ref (on a pull_request run, typically the
+        # synthetic merge commit) rather than failing. The checkout below
+        # would then succeed against the WRONG commit, and the guard step's
+        # mismatch against expected-head-sha would read as the same ordinary
+        # "branch-ref advanced" race — leaving the run green with
+        # committed: false instead of surfacing the caller's empty
+        # expression.
+        #
         # Two independent things can be wrong with pr-number, checked
         # separately so the error names the actual mistake:
         #   - it's '' while comment-marker's freshness comment or
@@ -165,12 +176,17 @@ jobs:
         #     hiccups), which would hide a caller misconfiguration behind
         #     the same "no comment posted" symptom as a transient failure.
         env:
+          BRANCH_REF: ${{ inputs.branch-ref }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
           COMMENT_MARKER: ${{ inputs.comment-marker }}
           DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
         run: |
           set -euo pipefail
+          if [ -z "$BRANCH_REF" ]; then
+            echo "::error::branch-ref is '' — checkout would silently fall back to the triggering event's own ref instead of failing. Check the caller's expression (e.g. github.event.pull_request.head.ref is empty on events without a pull_request context)."
+            exit 1
+          fi
           if ! [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::expected-head-sha must be a full 40-character commit SHA, got '$EXPECTED_HEAD_SHA' — check the caller's expression (e.g. github.event.pull_request.head.sha is empty on events without a pull_request context)."
             exit 1
