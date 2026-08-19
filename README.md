@@ -39,7 +39,16 @@ jobs:
 
   commit:
     needs: render
-    if: needs.render.result == 'success' && github.event_name == 'pull_request'
+    # head.repo.full_name == repository is required, not optional: this
+    # workflow always checks out and pushes to the CALLER's own repository
+    # (github.repository), authenticated with the caller's own GITHUB_TOKEN.
+    # A fork PR's branch doesn't exist there at all — checkout would simply
+    # fail — UNLESS the base repo happens to have a same-named branch, in
+    # which case it would silently check out and commit to the wrong branch
+    # instead. Same-repo PRs only.
+    if: >-
+      needs.render.result == 'success' && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: write
       actions: write
