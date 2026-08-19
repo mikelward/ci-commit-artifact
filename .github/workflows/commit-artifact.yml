@@ -420,7 +420,23 @@ jobs:
           # check guards, since there's no empty-diff signal to catch it.
           # `find -name .git` matches the exact basename at any depth, so
           # this catches both a `.git` directory and a stray `.git` file.
-          git_entries=$(find "$DEST_PATH" -name .git)
+          #
+          # $GITHUB_WORKSPACE/$DEST_PATH, not the bare $DEST_PATH: find's
+          # own argument syntax is `find [path...] [expression]`, and it
+          # decides "path" vs "expression" by whether an argument starts
+          # with '-' — with NO `--` escape hatch the way most GNU tools
+          # have one. A dest-path like "-delete" (already validated as a
+          # safe relative path by the checks above — nothing here rejects
+          # a leading '-') would make find read it as the primary `-delete`
+          # instead of a path, defaulting the search root to '.' (this
+          # step's cwd, the checkout root) and deleting every file found
+          # there. Verified directly against a real filesystem: bare
+          # `find "-delete" -name .git` recursively deleted an entire
+          # populated directory tree. Prefixing with $GITHUB_WORKSPACE
+          # guarantees the argument always starts with '/', which find can
+          # never parse as an expression — confirmed the same repro then
+          # errors cleanly ("No such file or directory") instead.
+          git_entries=$(find "$GITHUB_WORKSPACE/$DEST_PATH" -name .git)
           if [ -n "$git_entries" ]; then
             echo "::error::the artifact contains .git entries under $DEST_PATH, which git add -f silently skips rather than staging or erroring on:"
             echo "$git_entries" | sed 's/^/::error::  /'
