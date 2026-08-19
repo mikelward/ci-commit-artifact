@@ -334,6 +334,35 @@ test("throws on a surplus closing bracket, not just a missing one", () => {
   assert.deepEqual(doc.foo, [["a"], ["b"]]);
 });
 
+test("throws on an empty element in a flow sequence, while still allowing a single trailing comma", () => {
+  // "[ubuntu-latest,,other]" (two commas in a row) pushed an empty
+  // `current` at the second comma, and parseScalar turned that empty
+  // string into `null` — so a missing element silently became a literal
+  // null in the array instead of being rejected. Verified against
+  // yaml.safe_load, which raises a ParserError for a doubled comma, a
+  // leading comma, and a whitespace-only element alike, but accepts a
+  // SINGLE trailing comma (dropped, not an element at all).
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest,,other]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [,ubuntu-latest,other]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [a, ,b]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [a,b,,]\n"),
+    /empty element in flow sequence/,
+  );
+  // A single trailing comma is valid YAML and must still parse.
+  const doc = parseWorkflowYaml("runs-on: [ubuntu-latest, other,]\n");
+  assert.deepEqual(doc["runs-on"], ["ubuntu-latest", "other"]);
+});
+
 test("prefers the more specific unterminated-quote error over a generic bracket-imbalance one", () => {
   // 'a: ["b, c]' has an unterminated quote AND, read as pure bracket
   // counting, an "imbalance" (the quote swallows the sequence's own
