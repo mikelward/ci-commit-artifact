@@ -436,7 +436,28 @@ jobs:
           # guarantees the argument always starts with '/', which find can
           # never parse as an expression — confirmed the same repro then
           # errors cleanly ("No such file or directory") instead.
-          git_entries=$(find "$GITHUB_WORKSPACE/$DEST_PATH" -name .git)
+          #
+          # realpath -m on top of that, not just the raw concatenation: a
+          # dest-path like "missing/../snapshots" (an accepted shape — it
+          # already resolves inside the checkout, same as the "Empty the
+          # destination" step's own already-handled case) needs "missing"
+          # to actually exist as a real, traversable directory for `find`
+          # to walk into it and back out via '..' — but it never does.
+          # git add and actions/download-artifact both handle this shape
+          # fine, because both resolve '..' lexically before ever touching
+          # the filesystem (verified against download-artifact's own
+          # source: it calls `path.resolve(inputs.path)` before creating
+          # anything, so "missing" is never created; and `git add -f -A --
+          # "missing/../snapshots"` stages correctly with no such
+          # directory needed) — but a literal `find` walk isn't lexical,
+          # it's a real directory traversal, so it fails closed with
+          # "No such file or directory" and set -e aborts an otherwise
+          # completely valid commit. realpath -m collapses '..' the same
+          # lexical way `path.resolve` and git's pathspec matching do,
+          # without needing "missing" to exist — verified directly with
+          # this exact shape before adding it here.
+          resolved_dest=$(realpath -m -- "$GITHUB_WORKSPACE/$DEST_PATH")
+          git_entries=$(find "$resolved_dest" -name .git)
           if [ -n "$git_entries" ]; then
             echo "::error::the artifact contains .git entries under $DEST_PATH, which git add -f silently skips rather than staging or erroring on:"
             echo "$git_entries" | sed 's/^/::error::  /'
