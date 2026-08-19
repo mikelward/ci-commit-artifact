@@ -420,6 +420,32 @@ test("throws on a tagged scalar, whether the tag is a standard resolvable one or
   );
 });
 
+test("throws on a plain scalar starting with a reserved indicator (@, `, %), but not on one merely containing it", () => {
+  // "runs-on: @invalid" previously fell through to the plain-scalar
+  // return, silently accepting it as ordinary text. Verified against
+  // yaml.safe_load, which raises a ScannerError ("while scanning for the
+  // next token") for a leading "@", "`" or "%" alike — but only in the
+  // LEADING position: the same characters elsewhere in a scalar are
+  // ordinary content ("b@c", "b`c", "100%" all parse fine), so this must
+  // check startsWith, not a bare includes.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: @invalid\n"),
+    /reserved leading character/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: `invalid\n"),
+    /reserved leading character/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: %invalid\n"),
+    /reserved leading character/,
+  );
+  const doc = parseWorkflowYaml("a: b@c\nc: b`c\nd: 100%\n");
+  assert.equal(doc.a, "b@c");
+  assert.equal(doc.c, "b`c");
+  assert.equal(doc.d, "100%");
+});
+
 test("prefers the more specific unterminated-quote error over a generic bracket-imbalance one", () => {
   // 'a: ["b, c]' has an unterminated quote AND, read as pure bracket
   // counting, an "imbalance" (the quote swallows the sequence's own

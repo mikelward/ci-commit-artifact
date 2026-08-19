@@ -159,6 +159,16 @@ function parseWorkflowYaml(text) {
     if (s.startsWith("!")) {
       throw new Error(`yaml-lite: tags are not supported (got ${JSON.stringify(s)})`);
     }
+    // "@", "`" and "%" are reserved as a plain scalar's OWN first
+    // character — verified against yaml.safe_load, which raises a
+    // ScannerError ("while scanning for the next token") for
+    // "runs-on: @invalid", "a: \`invalid" and "a: %invalid" alike, while
+    // the SAME characters elsewhere in a scalar are perfectly ordinary
+    // ("a: b@c", "a: b\`c", "a: 100%" all parse fine). Only the leading
+    // position is reserved, so this checks startsWith, not includes.
+    if (s.startsWith("@") || s.startsWith("`") || s.startsWith("%")) {
+      throw new Error(`yaml-lite: reserved leading character in a plain scalar (got ${JSON.stringify(s)})`);
+    }
     // A scalar that OPENS a quote must genuinely close it, right at its own
     // last character — not just happen to end in a quote character (an
     // escaped one doesn't count) and not fail to close at all. A blind
