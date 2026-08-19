@@ -179,6 +179,76 @@ test("refuses to rm -rf a dest-path that isn't a safe relative path inside the c
   assert.doesNotMatch(clearStep.run, /rm -rf -- "\$DEST_PATH"/);
 });
 
+test("refuses to rm -rf a dest-path that resolves through a symlink, direct or intermediate", () => {
+  // Real gap, found by Codex review and verified against a real filesystem
+  // before this test was written: realpath -m follows symlinks in every
+  // existing leading path component. The checkout at branch-ref is a PR's
+  // own branch content, so a PR that replaces the intended destination (or
+  // any directory above it) with a symlink to some OTHER real directory in
+  // the checkout makes $resolved point there instead — the containment
+  // checks (inside GITHUB_WORKSPACE, not .git) pass regardless, since the
+  // symlink's target is still somewhere in the checkout, and this step then
+  // deletes that other directory's contents while the symlink itself
+  // survives, dangling. Executes the actual step script against a real
+  // filesystem rather than asserting structure, since the earlier
+  // git-pathspec and __proto__ fixes in this PR were both caught the same
+  // way — the failure mode here is exactly "the regex looks right but the
+  // shell does something else."
+  const clearStep = step("Empty the destination before extracting the artifact");
+  const script = clearStep.run;
+
+  function runClear(destPath, setupFn) {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "clear-step-"));
+    try {
+      setupFn(workspace);
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", script], {
+          cwd: workspace,
+          env: { ...process.env, GITHUB_WORKSPACE: workspace, DEST_PATH: destPath },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = typeof e.status === "number" ? e.status : 1;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  }
+
+  // Direct symlink at dest-path, pointing at a real sibling directory.
+  const direct = runClear("snapshots", (ws) => {
+    fs.mkdirSync(path.join(ws, "important"));
+    fs.writeFileSync(path.join(ws, "important", "secret.txt"), "sensitive");
+    fs.symlinkSync("important", path.join(ws, "snapshots"));
+  });
+  assert.equal(direct.code, 1, "a direct symlink at dest-path must be refused");
+  assert.match(direct.output, /symlink/);
+
+  // Symlink in an intermediate path component, not the final one.
+  const intermediate = runClear("nested/link/deeper", (ws) => {
+    fs.mkdirSync(path.join(ws, "important"), { recursive: true });
+    fs.mkdirSync(path.join(ws, "nested"), { recursive: true });
+    fs.symlinkSync("../important", path.join(ws, "nested", "link"));
+  });
+  assert.equal(intermediate.code, 1, "a symlink in an intermediate component must be refused too");
+  assert.match(intermediate.output, /symlink/);
+
+  // Regression: an ordinary nonexistent path (the ordinary first-run case,
+  // where dest-path has never existed before) must still be accepted.
+  const nonexistent = runClear("brandnew/sub", () => {});
+  assert.equal(nonexistent.code, 0, "a plain nonexistent dest-path must not be rejected as a symlink");
+
+  // Regression: an ordinary already-existing real directory must still be
+  // accepted (this is the common re-run case).
+  const realDir = runClear("existing", (ws) => {
+    fs.mkdirSync(path.join(ws, "existing"));
+  });
+  assert.equal(realDir.code, 0, "a plain real directory must not be rejected as a symlink");
+});
+
 test("the destination is emptied before the artifact is downloaded into it", () => {
   // download-artifact extracts into dest-path, it doesn't replace it — a
   // file the new render dropped would otherwise survive untouched and
