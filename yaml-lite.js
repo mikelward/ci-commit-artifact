@@ -160,7 +160,20 @@ function parseWorkflowYaml(text) {
     if ((s.startsWith("'") && !hasClosingQuote(s, "'")) || (s.startsWith('"') && !hasClosingQuote(s, '"'))) {
       throw new Error(`yaml-lite: unterminated quoted scalar (got ${JSON.stringify(s)})`);
     }
-    if (s.startsWith("{") && s.endsWith("}")) {
+    if (s.startsWith("{")) {
+      // Checked separately from endsWith("}") below — a compound
+      // startsWith("{") && endsWith("}") condition (this file's first
+      // version) is false for an unmatched opener ("permissions:
+      // {contents: write", no closing brace) and falls through every
+      // remaining branch to the plain-scalar return at the bottom,
+      // silently returning the malformed text instead of rejecting it.
+      // Verified against yaml.safe_load("permissions: {contents: write\n"),
+      // which raises a ParserError ("while parsing a flow mapping")
+      // rather than returning a value — the same shape of bug the
+      // unterminated-flow-sequence check below already guards against.
+      if (!s.endsWith("}")) {
+        throw new Error(`yaml-lite: unterminated flow mapping (got ${JSON.stringify(s)})`);
+      }
       // An empty flow mapping ("permissions: {}", least-privilege
       // workflows' standard idiom) is unambiguous and costs nothing to
       // support. A NON-empty one ("{ contents: read }") is out of this
@@ -195,6 +208,20 @@ function parseWorkflowYaml(text) {
       if (!s.endsWith("]")) {
         throw new Error(`yaml-lite: unterminated flow sequence (got ${JSON.stringify(s)})`);
       }
+      // endsWith("]") alone only rules out a MISSING close, not a surplus
+      // one: "runs-on: [ubuntu-latest]]" still ends with "]", but the
+      // extra bracket makes it invalid YAML — verified against
+      // yaml.safe_load, which raises a ParserError ("while parsing a
+      // block mapping") rather than returning a value. The old check
+      // sliced off exactly one leading/trailing character regardless,
+      // handing splitFlowSequence "ubuntu-latest]" and silently returning
+      // ["ubuntu-latest]"] — a real bracket smuggled into element content.
+      // hasBalancedFlowBrackets confirms the sequence's own brackets net
+      // to zero and land on the string's LAST character, not just that a
+      // "]" appears somewhere after the "[".
+      if (!hasBalancedFlowBrackets(s)) {
+        throw new Error(`yaml-lite: unbalanced flow sequence brackets (got ${JSON.stringify(s)})`);
+      }
       const inner = s.slice(1, -1).trim();
       if (inner === "") return [];
       return splitFlowSequence(inner).map(parseScalar);
@@ -225,6 +252,58 @@ function parseWorkflowYaml(text) {
       }
     }
     return false;
+  }
+
+  // Whether `s` (a flow sequence, brackets included) has genuinely
+  // balanced [ ] delimiters: depth never goes negative (no unmatched
+  // closer) and returns to exactly 0 only once, at the string's own last
+  // character (no unmatched opener, and nothing trailing after the
+  // sequence's own close — "[a]]" and "[a][b]" both fail this the same
+  // way, at the first bracket that closes the depth-0 case is not the
+  // final character). Quote-aware — the same reason splitFlowSequence and
+  // stripInlineComment are: a bracket character inside a quoted element
+  // ("[\"a]b\"]") is content, not a delimiter, so it must not be counted.
+  function hasBalancedFlowBrackets(s) {
+    let depth = 0;
+    let quote = null;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (quote) {
+        if (quote === '"' && ch === "\\") {
+          i++; // skip the escaped character
+          continue;
+        }
+        if (ch === quote) {
+          if (quote === "'" && s[i + 1] === "'") {
+            i++; // escaped '' inside a single-quoted element
+            continue;
+          }
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        continue;
+      }
+      if (ch === "[") {
+        depth++;
+      } else if (ch === "]") {
+        depth--;
+        if (depth < 0) return false;
+        if (depth === 0) return i === s.length - 1;
+      }
+    }
+    // A quote still open at the string's end ('a: ["b, c]') is a
+    // different, more specific defect — an unterminated quoted scalar —
+    // that parseScalar/hasClosingQuote already catches once this element
+    // is actually parsed. Deferring to that here (rather than reporting
+    // it as an unbalanced-bracket problem) keeps the more accurate
+    // diagnostic: verified against yaml.safe_load, which reports this
+    // shape as "while scanning a quoted scalar", not a flow-sequence
+    // parse error.
+    if (quote) return true;
+    return depth === 0;
   }
 
   // Same escape handling as stripInlineComment, and for the same reason: a

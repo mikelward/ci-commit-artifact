@@ -311,6 +311,44 @@ test("throws on an unterminated flow sequence, rather than returning the malform
   assert.deepEqual(doc["runs-on"], ["ubuntu-latest"]);
 });
 
+test("throws on a surplus closing bracket, not just a missing one", () => {
+  // "runs-on: [ubuntu-latest]]" still ends with "]", so the unterminated
+  // check above doesn't catch it — the old code sliced off exactly one
+  // leading/trailing character regardless and handed splitFlowSequence
+  // "ubuntu-latest]", silently returning ["ubuntu-latest]"] (a literal "]"
+  // smuggled into element content) instead of rejecting it. Verified
+  // against yaml.safe_load, which raises a ParserError ("while parsing a
+  // block mapping") rather than returning a value.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest]]\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // Content that closes and then continues past the close, not just a
+  // trailing bracket — same defect, different shape.
+  assert.throws(
+    () => parseWorkflowYaml("foo: [a][b]\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // A nested, genuinely balanced flow sequence must still parse.
+  const doc = parseWorkflowYaml("foo: [[a], [b]]\n");
+  assert.deepEqual(doc.foo, [["a"], ["b"]]);
+});
+
+test("prefers the more specific unterminated-quote error over a generic bracket-imbalance one", () => {
+  // 'a: ["b, c]' has an unterminated quote AND, read as pure bracket
+  // counting, an "imbalance" (the quote swallows the sequence's own
+  // closing "]" into its own unclosed run). Verified against
+  // yaml.safe_load, which reports this shape as "while scanning a quoted
+  // scalar" — the more specific, more useful diagnostic — not a
+  // flow-sequence parse error, so hasBalancedFlowBrackets defers to the
+  // existing unterminated-quoted-scalar check rather than reporting its
+  // own generic error first.
+  assert.throws(
+    () => parseWorkflowYaml('a: ["b, c]\n'),
+    /unterminated quoted scalar/,
+  );
+});
+
 test("throws on a tab in a line's indentation, including when the tab is the line's very FIRST character", () => {
   // The original tab check computed indent by matching only leading SPACES
   // (raw.replace(/^ */, "")), so a line whose indentation is a tab from its
@@ -391,6 +429,22 @@ test("accepts an empty flow mapping as a value, and throws on a non-empty one", 
   assert.throws(
     () => parseWorkflowYaml("permissions: {contents: read}\n"),
     /flow mappings are not supported/,
+  );
+});
+
+test("throws on an unterminated flow mapping, rather than returning the malformed text as a plain string", () => {
+  // "permissions: {contents: write" (no closing brace) previously fell
+  // through the old compound startsWith("{") && endsWith("}") condition —
+  // false here, since there's no closing brace at all — straight to
+  // parseScalar's final `return s`, silently returning the literal string
+  // "{contents: write" instead of raising. Verified against
+  // yaml.safe_load("permissions: {contents: write\n"), which raises a
+  // ParserError ("while parsing a flow mapping") rather than returning a
+  // value — the same shape of bug the unterminated-flow-sequence check
+  // above already guards against for "[".
+  assert.throws(
+    () => parseWorkflowYaml("permissions: {contents: write\n"),
+    /unterminated flow mapping/,
   );
 });
 
