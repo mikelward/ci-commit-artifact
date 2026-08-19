@@ -138,15 +138,32 @@ function parseWorkflowYaml(text) {
     return s;
   }
 
+  // Same escape handling as stripInlineComment, and for the same reason: a
+  // quoted flow-sequence element can contain the comma or the quote
+  // character this function splits/closes on. `"x\"y,z"` is ONE element
+  // (`x"y,z`) to a real YAML parser — closing the quote at the escaped `"`
+  // (as an earlier version did, by only checking `ch === quote`) makes the
+  // comma that follows read as a top-level separator, corrupting it into
+  // two. Index-based, not for-of, so `i++` can consume the escaped
+  // character's index directly.
   function splitFlowSequence(inner) {
     const parts = [];
     let depth = 0;
     let quote = null;
     let current = "";
-    for (const ch of inner) {
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
       if (quote) {
         current += ch;
-        if (ch === quote) quote = null;
+        if (ch === quote) {
+          if (quote === "'" && inner[i + 1] === "'") {
+            current += inner[++i]; // escaped '' inside a single-quoted element
+            continue;
+          }
+          quote = null;
+        } else if (quote === '"' && ch === "\\") {
+          current += inner[++i]; // skip the escaped character
+        }
         continue;
       }
       if (ch === "'" || ch === '"') {

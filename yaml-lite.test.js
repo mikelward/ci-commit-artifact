@@ -27,6 +27,24 @@ test("parses flow sequences", () => {
   assert.deepEqual(doc.empty, []);
 });
 
+test("flow sequence splitting: an escaped quote inside a double-quoted element doesn't close the quote early", () => {
+  // `"x\"y,z"` is ONE element (`x"y,z`) — closing the quote at the escaped
+  // `"` instead of skipping it would read the comma that follows as a
+  // top-level separator, corrupting one element into two.
+  const doc = parseWorkflowYaml(String.raw`a: ["x\"y,z", q]` + "\n");
+  assert.deepEqual(doc.a, ['x"y,z', "q"]);
+  const doc2 = parseWorkflowYaml(String.raw`a: [q, "x\"y,z"]` + "\n");
+  assert.deepEqual(doc2.a, ["q", 'x"y,z']);
+});
+
+test("flow sequence splitting: a doubled '' inside a single-quoted element doesn't close the quote early", () => {
+  // YAML's escape for a literal ' inside a single-quoted scalar is doubling
+  // it, not backslashing — the same rule stripInlineComment already
+  // applies to a plain scalar.
+  const doc = parseWorkflowYaml("a: ['x''y,z', q]\n");
+  assert.deepEqual(doc.a, ["x'y,z", "q"]);
+});
+
 test("parses a block sequence of mappings (- key: value siblings)", () => {
   const doc = parseWorkflowYaml(
     "steps:\n  - name: one\n    run: echo hi\n  - name: two\n    run: echo bye\n",
