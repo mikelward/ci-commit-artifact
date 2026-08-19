@@ -1,0 +1,13 @@
+# Policy for zizmor; the advisory workflow beside this file runs it.
+#
+# The default demands hash pins everywhere. That collides with a decision
+# already made twice elsewhere in this fleet (mikelward/clothescast,
+# mikelward/codex-review): official actions may pin to a tag instead.
+# Hash-pinning them is a deliberate open question, tracked the same way
+# those repos track it for themselves — not resolved here either.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "actions/*": ref-pin
+        "*": hash-pin
