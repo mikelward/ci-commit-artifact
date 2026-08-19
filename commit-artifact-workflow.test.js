@@ -101,18 +101,33 @@ test("fails fast, before checkout, when comment-marker or dispatch-workflow is s
   assert.ok(validateIdx > -1, "no validation step found");
   assert.ok(validateIdx < checkoutIdx, "validation must run before checkout, not after");
   const validate = steps[validateIdx];
-  // The step's own if: only decides whether it runs at ALL (skip the check
-  // entirely for a caller that sets none of the three inputs) — the actual
-  // missing-pr-number logic now lives in the run: block, alongside the
-  // format check below, so both conditions get their own named error.
-  assert.match(
-    validate.if,
-    /inputs\.pr-number != '' \|\| inputs\.comment-marker != '' \|\| inputs\.dispatch-workflow != ''/,
-  );
+  // The step itself runs UNCONDITIONALLY now (no if: at all) — it also
+  // validates expected-head-sha's format, which is always required and
+  // always worth checking, so it can no longer skip itself the way it did
+  // when it only had the three optional inputs to check. The actual
+  // missing-pr-number logic lives in the run: block, alongside the format
+  // check below, so both conditions get their own named error.
+  assert.equal(validate.if, undefined, "the validation step should run unconditionally");
   assert.match(
     validate.run,
     /\[ -z "\$PR_NUMBER" \] && \{ \[ -n "\$COMMENT_MARKER" \] \|\| \[ -n "\$DISPATCH_WORKFLOW" \]; \}/,
   );
+  assert.match(validate.run, /exit 1/);
+});
+
+test("fails fast on an expected-head-sha that isn't a real full commit SHA", () => {
+  // A caller typically supplies github.event.pull_request.head.sha, which
+  // is EMPTY on any event without a pull_request context (workflow_dispatch,
+  // say) — and workflow_call's required: true only checks the caller
+  // supplied the input KEY, not that its value is non-empty. Without this
+  // check, an empty EXPECTED_HEAD_SHA would compare unequal to guard's real
+  // actual_head_sha unconditionally, and the mismatch is read as "branch-ref
+  // advanced, skip" (a ::warning::, non-fatal) — a caller misconfiguration
+  // silently absorbed as the ordinary race this workflow already handles.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.equal(validate.env.EXPECTED_HEAD_SHA, "${{ inputs.expected-head-sha }}");
+  assert.match(validate.run, /! \[\[ "\$EXPECTED_HEAD_SHA" =~ \^\[0-9a-f\]\{40\}\$ \]\]/);
   assert.match(validate.run, /exit 1/);
 });
 
@@ -144,7 +159,15 @@ test("refuses to rm -rf a dest-path that isn't a safe relative path inside the c
   assert.match(clearStep.run, /realpath -m/, "should canonicalize dest-path before trusting it");
   assert.match(clearStep.run, /GITHUB_WORKSPACE/, "should check the resolved path against the checkout root");
   assert.match(clearStep.run, /\.git/, "should refuse a dest-path resolving inside .git");
-  assert.match(clearStep.run, /rm -rf -- "\$DEST_PATH"/);
+  // $resolved, not the raw $DEST_PATH: rm resolves a path by actually
+  // traversing each component, so a dest-path like "missing/../snapshots"
+  // (where "missing" doesn't exist) validates fine — realpath -m collapses
+  // '..' lexically without touching the filesystem — but then silently
+  // deletes NOTHING when passed to rm literally, since -f suppresses the
+  // "no such file or directory" from the failed traversal into "missing".
+  // Verified with a real filesystem before fixing.
+  assert.match(clearStep.run, /rm -rf -- "\$resolved"/);
+  assert.doesNotMatch(clearStep.run, /rm -rf -- "\$DEST_PATH"/);
 });
 
 test("the destination is emptied before the artifact is downloaded into it", () => {
@@ -158,7 +181,7 @@ test("the destination is emptied before the artifact is downloaded into it", () 
   assert.ok(clearIdx < downloadIdx, "the destination must be cleared BEFORE the download, not after");
   const clear = steps[clearIdx];
   assert.match(clear.if, /steps\.guard\.outputs\.skip != 'true'/);
-  assert.match(clear.run, /rm -rf -- "\$DEST_PATH"/);
+  assert.match(clear.run, /rm -rf -- "\$resolved"/);
   assert.equal(clear.env["DEST_PATH"], "${{ inputs.dest-path }}");
 });
 
@@ -343,7 +366,7 @@ test("the freshness comment re-checks the PR's live head before writing a DOWNLO
   const script = step("Comment freshness on the PR").with.script;
   const paginateIdx = script.indexOf("github.paginate(github.rest.issues.listComments");
   const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
-  const mismatchIdx = script.indexOf("pr.data.head.sha !== process.env.HEAD_SHA");
+  const mismatchIdx = script.indexOf("pr.data.head.sha !== referenceHeadSha");
   const updateIdx = script.indexOf("github.rest.issues.updateComment(");
   const createIdx = script.indexOf("github.rest.issues.createComment(");
   assert.ok(paginateIdx > -1, "no comment-listing call found in the freshness script");
@@ -383,14 +406,19 @@ function freshnessBranch(script, openMarker, closeMarker) {
   return script.slice(start, end);
 }
 
-test("a checkout/guard/clear failure reports WITHOUT the live-head re-check gating it", () => {
-  // guard may not have even run when checkout itself fails, so HEAD_SHA can
-  // be empty here — a live-head comparison gating this branch would make it
-  // unreachable (an empty HEAD_SHA never equals a real PR head sha), and an
-  // early failure like this is worth surfacing regardless of what any other
-  // overlapping run goes on to report. Regression coverage for the earlier
-  // version of this fix, which put the live-head check ahead of every
-  // status branch including this one.
+test("a checkout/guard/clear failure DOES use the live-head re-check, against EXPECTED_HEAD_SHA not HEAD_SHA", () => {
+  // guard may not have even run when checkout itself fails, so HEAD_SHA (a
+  // step output) can be empty here — but EXPECTED_HEAD_SHA is a WORKFLOW
+  // INPUT, present regardless of what failed, and it names exactly the head
+  // this failed run was trying to act on. Without this check, an older
+  // overlapping run's transient checkout/guard/clear failure could still
+  // overwrite a NEWER run's already-accurate, more current report — the
+  // exact race the SKIPPED and DOWNLOAD/COMMIT/COMMITTED branches were
+  // already fixed against, just missed here because this branch's own
+  // history (see the surrounding comment) was written to solve a DIFFERENT
+  // problem (an empty HEAD_SHA making the check unconditionally fail) by
+  // skipping the check outright, rather than by picking a reference value
+  // that's actually available.
   const script = step("Comment freshness on the PR").with.script;
   const branch = freshnessBranch(
     script,
@@ -398,20 +426,16 @@ test("a checkout/guard/clear failure reports WITHOUT the live-head re-check gati
     "process.env.SKIPPED === 'true'",
   );
   assert.ok(branch.includes("An earlier step failed"), "early-failure status text not found in its own branch");
-  assert.ok(!branch.includes("pulls.get"), "the early-failure branch must not depend on the live-head re-check");
-  // Not just "not textually inside this branch" — the live-head check must
-  // not sit ahead of the WHOLE if/else chain either, gating this branch's
-  // reachability at runtime without appearing inside its own text. The
-  // CHECKOUT_OUTCOME check is this script's first real statement (after the
-  // marker/noun/headSha/prNumber declarations); the live-head re-check
-  // fetch is not.
-  const checkoutCheckIdx = script.indexOf("process.env.CHECKOUT_OUTCOME !== 'success'");
-  const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
-  assert.ok(checkoutCheckIdx > -1 && pullsGetIdx > -1);
-  assert.ok(
-    checkoutCheckIdx < pullsGetIdx,
-    "the CHECKOUT_OUTCOME check must run before the live-head re-check, not be gated behind it",
+  assert.match(branch, /needsLiveHeadCheck = true/, "this branch must opt into the live-head re-check");
+  assert.match(
+    branch,
+    /referenceHeadSha = process\.env\.EXPECTED_HEAD_SHA/,
+    "this branch must redirect the comparison to EXPECTED_HEAD_SHA (a workflow input, always present), not HEAD_SHA (a step output, often empty here)",
   );
+  // EXPECTED_HEAD_SHA has to actually reach the script for that redirect to
+  // work — a workflow input, not spliced directly (same injection concern
+  // as every other PR-influenced value in this file).
+  assert.equal(step("Comment freshness on the PR").env.EXPECTED_HEAD_SHA, "${{ inputs.expected-head-sha }}");
 });
 
 test("a SKIPPED (branch-moved) run posts nothing at all, rather than risking a stale overwrite", () => {
