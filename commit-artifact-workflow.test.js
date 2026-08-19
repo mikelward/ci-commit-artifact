@@ -294,14 +294,15 @@ test("the SKIPPED (branch-moved) case is checked before DOWNLOAD_OUTCOME in the 
   assert.ok(skippedIdx < downloadCheckIdx);
 });
 
-test("the freshness comment re-checks the PR's live head before writing, and skips on a mismatch", () => {
+test("the freshness comment re-checks the PR's live head before writing a DOWNLOAD/COMMIT/COMMITTED status, and skips on a mismatch", () => {
   // Overlapping runs are expected (cancel-in-progress is asynchronous), so
   // an older run can reach this step after a newer run already posted an
-  // accurate status. Without re-confirming the PR's head is still what this
-  // run's own HEAD_SHA is about, whichever run's write happens to land LAST
-  // wins — even a stale "branch advanced"/"download failed"/"commit failed"
-  // overwriting a fresh, accurate comment, with no further push coming to
-  // correct it.
+  // accurate status for the DOWNLOAD/COMMIT/COMMITTED branches (the ones
+  // guard confirmed ran against the still-current expected-head-sha).
+  // Without re-confirming the PR's head is still what this run's own
+  // HEAD_SHA is about, whichever run's write happens to land LAST wins —
+  // even a stale "download failed"/"commit failed"/"up-to-date" overwriting
+  // a fresh, accurate comment, with no further push coming to correct it.
   const script = step("Comment freshness on the PR").with.script;
   const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
   const mismatchIdx = script.indexOf("pr.data.head.sha !== process.env.HEAD_SHA");
@@ -318,6 +319,66 @@ test("the freshness comment re-checks the PR's live head before writing, and ski
   // every other PR-influenced value in this file (see the sibling test
   // above), so this must reach the script only via `process.env`.
   assert.match(script, /await github\.rest\.pulls\.get\(\{ \.\.\.context\.repo, pull_number: prNumber \}\)/);
+});
+
+// Extracts the literal text of one branch of the if/else chain, by its own
+// opening condition through to the line that opens the NEXT branch (or
+// closes the chain). Fragile only to a rewrite of these exact condition
+// strings, which every other test in this file already depends on too.
+function freshnessBranch(script, openMarker, closeMarker) {
+  const start = script.indexOf(openMarker);
+  assert.ok(start > -1, `branch opener not found: ${openMarker}`);
+  const end = script.indexOf(closeMarker, start);
+  assert.ok(end > -1, `branch closer not found: ${closeMarker}`);
+  return script.slice(start, end);
+}
+
+test("a checkout/guard/clear failure reports WITHOUT the live-head re-check gating it", () => {
+  // guard may not have even run when checkout itself fails, so HEAD_SHA can
+  // be empty here — a live-head comparison gating this branch would make it
+  // unreachable (an empty HEAD_SHA never equals a real PR head sha), and an
+  // early failure like this is worth surfacing regardless of what any other
+  // overlapping run goes on to report. Regression coverage for the earlier
+  // version of this fix, which put the live-head check ahead of every
+  // status branch including this one.
+  const script = step("Comment freshness on the PR").with.script;
+  const branch = freshnessBranch(
+    script,
+    "process.env.CHECKOUT_OUTCOME !== 'success'",
+    "process.env.SKIPPED === 'true'",
+  );
+  assert.ok(branch.includes("An earlier step failed"), "early-failure status text not found in its own branch");
+  assert.ok(!branch.includes("pulls.get"), "the early-failure branch must not depend on the live-head re-check");
+  // Not just "not textually inside this branch" — the live-head check must
+  // not sit ahead of the WHOLE if/else chain either, gating this branch's
+  // reachability at runtime without appearing inside its own text. The
+  // CHECKOUT_OUTCOME check is this script's first real statement (after the
+  // marker/noun/headSha/prNumber declarations); the live-head re-check
+  // fetch is not.
+  const checkoutCheckIdx = script.indexOf("process.env.CHECKOUT_OUTCOME !== 'success'");
+  const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
+  assert.ok(checkoutCheckIdx > -1 && pullsGetIdx > -1);
+  assert.ok(
+    checkoutCheckIdx < pullsGetIdx,
+    "the CHECKOUT_OUTCOME check must run before the live-head re-check, not be gated behind it",
+  );
+});
+
+test("a SKIPPED (branch-moved) run posts nothing at all, rather than risking a stale overwrite", () => {
+  // A skipped run's HEAD_SHA falls back to guard's own actual_head_sha —
+  // the head it OBSERVED, not a head this run produced or confirmed as
+  // current. A legitimate "up-to-date" run for that SAME head reports the
+  // identical HEAD_SHA once nothing has changed since, so a live-head
+  // comparison can't tell a skipped run's stale deferral apart from a
+  // genuine, current report for the same head: both compare equal to the
+  // live head whenever nothing has moved. The only fix that actually closes
+  // that ambiguity is not posting anything for a skipped run at all — the
+  // run that pushed the newer head is responsible for reporting on it.
+  const script = step("Comment freshness on the PR").with.script;
+  const branch = freshnessBranch(script, "process.env.SKIPPED === 'true'", "} else {");
+  assert.match(branch, /\breturn;/, "the SKIPPED branch must return without posting a comment");
+  assert.ok(!branch.includes("pulls.get"), "the SKIPPED branch must not perform (or depend on) the live-head re-check");
+  assert.ok(!branch.includes("status ="), "the SKIPPED branch must not build a status message to post");
 });
 
 test("checkout/guard/clear failing before the download step is checked reports distinctly, first in the chain", () => {

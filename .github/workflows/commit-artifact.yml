@@ -322,64 +322,82 @@ jobs:
             const headSha = (process.env.HEAD_SHA || '').slice(0, 7);
             const prNumber = Number(process.env.PR_NUMBER);
 
-            // Overlapping runs are expected here — expected-head-sha's own
-            // description above notes cancel-in-progress is asynchronous —
-            // so an older run can still reach this step after a newer run,
-            // triggered by a later push, already posted its own accurate
-            // status. Without this check, whichever run's comment step
-            // happens to finish LAST wins even when it's reporting on a push
-            // that is no longer the PR's head, and nothing ever corrects a
-            // stale "branch advanced"/"download failed"/"commit failed"
-            // status left behind that way — there's no further push coming
-            // to trigger a fixing run. Re-fetching the PR's live head right
-            // before writing and comparing it to what THIS run's status is
-            // actually about (HEAD_SHA: this run's own new commit if it made
-            // one, else the head it found the branch at) catches that: a
-            // mismatch means some other run's dispatch has since landed and
-            // this report is already superseded, so skip rather than risk
-            // downgrading a fresher, accurate comment.
-            try {
-              const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
-              if (pr.data.head.sha !== process.env.HEAD_SHA) {
-                core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
-                return;
-              }
-            } catch (e) {
-              core.warning(`Could not confirm the PR's current head (${e.message}); skipping the freshness comment rather than risking overwriting a newer, accurate one.`);
-              return;
-            }
-
             let status;
             // checkout/guard/clear all run unconditionally (or nearly so —
             // guard has no if: at all, clear only requires guard to have
             // already succeeded with skip!='true'), so a non-success outcome
             // from any of them means the job failed BEFORE the download step
             // ever got a chance to run — distinct from download itself
-            // failing or finding nothing, which the next branch reports.
-            // Without this check that case fell through to "artifact wasn't
-            // available", which blames the wrong step.
+            // failing or finding nothing, which a later branch reports.
+            // Handled FIRST and unconditionally, with no live-head re-check
+            // (added below): guard may not have even run, so HEAD_SHA can be
+            // empty here, and a re-check gated on it would make this branch
+            // unreachable — an early failure is worth surfacing regardless
+            // of what any other overlapping run goes on to report.
             if (process.env.CHECKOUT_OUTCOME !== 'success' || process.env.GUARD_OUTCOME !== 'success' || process.env.CLEAR_OUTCOME === 'failure') {
               status = `⚠️ An earlier step failed before the artifact could be checked — see the run log.`;
             } else if (process.env.SKIPPED === 'true') {
-              status = `⏳ Branch advanced mid-run — not yet checked against \`${headSha}\`. The run that pushed it will report.`;
-            } else if (process.env.DOWNLOAD_OUTCOME !== 'success') {
-              // Ambiguous by construction (see the download step's own
-              // comment): either the artifact never existed this run, or the
-              // download itself failed transiently. Say so rather than
-              // guessing either "regenerated" or "up-to-date".
-              status = `⚠️ Could not verify — the \`${process.env.ARTIFACT_NAME}\` artifact wasn't available this run.`;
-            } else if (process.env.COMMIT_OUTCOME !== 'success') {
-              // The download succeeded, so the commit step DID run (its own
-              // if: requires exactly that) — a non-success outcome here
-              // means it ran and failed (e.g. a rejected push from a race),
-              // not "nothing to commit". COMMITTED is unset either way, so
-              // without this check a real failure would misreport as the
-              // clean up-to-date case below.
-              status = `⚠️ The commit step failed after a successful download — check the run log.`;
-            } else if (process.env.COMMITTED === 'true') {
-              status = `🔄 Regenerated ${noun}s this run.`;
+              // A skipped run observed the branch already past
+              // expected-head-sha before it did anything — the run that
+              // pushed the newer head is responsible for reporting on it,
+              // not this one. Posting anything here risks overwriting that
+              // other run's already-accurate report: HEAD_SHA falls back to
+              // guard's own actual_head_sha in this case, which is exactly
+              // what a legitimate "up-to-date" run for that SAME head also
+              // reports as its own HEAD_SHA once nothing changes after it
+              // runs — so a live-head comparison can't tell a skipped run's
+              // stale deferral apart from a genuine, current report for the
+              // same head (both compare equal to the live head whenever
+              // nothing has moved since). Skipping unconditionally, instead
+              // of trying to resolve that ambiguity with a comparison, is
+              // what actually closes it — the message already promised "the
+              // run that pushed it will report", so this run has nothing
+              // left to say.
+              core.info(`Branch advanced before this run's guard step — the run that pushed the newer head reports, not this one. Skipping the freshness comment.`);
+              return;
             } else {
-              status = `✅ ${noun}s up-to-date — no changes from this push.`;
+              // Guard confirmed the branch was still at expected-head-sha
+              // when THIS run checked it, so HEAD_SHA (this run's own new
+              // commit if it made one, else that confirmed head) is now a
+              // reliable stand-in for "what this run's report is about" —
+              // safe to re-check against the PR's LIVE head right before
+              // writing. Overlapping runs are expected (cancel-in-progress
+              // is asynchronous), so an older run can still reach this step
+              // after a newer run, triggered by a later push, already
+              // posted its own accurate status; without this, whichever
+              // comment write finishes LAST wins even when reporting on a
+              // push that's no longer the PR's head, and nothing ever
+              // corrects a stale status left behind that way.
+              try {
+                const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+                if (pr.data.head.sha !== process.env.HEAD_SHA) {
+                  core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
+                  return;
+                }
+              } catch (e) {
+                core.warning(`Could not confirm the PR's current head (${e.message}); skipping the freshness comment rather than risking overwriting a newer, accurate one.`);
+                return;
+              }
+
+              if (process.env.DOWNLOAD_OUTCOME !== 'success') {
+                // Ambiguous by construction (see the download step's own
+                // comment): either the artifact never existed this run, or
+                // the download itself failed transiently. Say so rather
+                // than guessing either "regenerated" or "up-to-date".
+                status = `⚠️ Could not verify — the \`${process.env.ARTIFACT_NAME}\` artifact wasn't available this run.`;
+              } else if (process.env.COMMIT_OUTCOME !== 'success') {
+                // The download succeeded, so the commit step DID run (its
+                // own if: requires exactly that) — a non-success outcome
+                // here means it ran and failed (e.g. a rejected push from a
+                // race), not "nothing to commit". COMMITTED is unset either
+                // way, so without this check a real failure would
+                // misreport as the clean up-to-date case below.
+                status = `⚠️ The commit step failed after a successful download — check the run log.`;
+              } else if (process.env.COMMITTED === 'true') {
+                status = `🔄 Regenerated ${noun}s this run.`;
+              } else {
+                status = `✅ ${noun}s up-to-date — no changes from this push.`;
+              }
             }
             const body = `${marker}\n**Status:** ${status}\n\nHead: \`${headSha}\``;
             // The lookup can't fail open the way the update/create below
