@@ -548,6 +548,75 @@ test("dest-path is treated as a literal git pathspec, not scanned for pathspec m
   assert.equal(step("Commit and push").env["GIT_LITERAL_PATHSPECS"], "1");
 });
 
+test("refuses to commit an artifact that itself contains a .git entry", () => {
+  // Real Codex finding: the dest-path validation earlier rejects a .git
+  // path COMPONENT in dest-path itself, but has no way to see what's
+  // inside the artifact the download step just extracted. `git add -f`
+  // doesn't error on a .git entry, it silently SKIPS it while still
+  // staging everything else -- verified directly with a real repo: with
+  // out/example/.git/config and out/example/real.txt both present,
+  // `git add -f -A -- out/example` stages only real.txt, exits 0, and
+  // says nothing about the dropped one. That's a successful-looking
+  // commit silently missing part of the artifact -- worse than the
+  // "nothing staged" case dest-path's own .git check guards, since
+  // there's no empty-diff signal here to catch it.
+  const commitStep = step("Commit and push");
+  assert.match(commitStep.run, /find "\$DEST_PATH" -name \.git/);
+  const gitAddIdx = commitStep.run.indexOf('git add -f -A -- "$DEST_PATH"');
+  const checkIdx = commitStep.run.indexOf('find "$DEST_PATH" -name .git');
+  assert.ok(gitAddIdx > -1, "the actual git add -f -A invocation should exist");
+  assert.ok(checkIdx > -1 && checkIdx < gitAddIdx, "the .git-entry check must run before git add");
+
+  const runCommit = (setupFn) => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-git-entry-"));
+    try {
+      execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+      setupFn(workspace);
+      const result = { code: 0, output: "" };
+      try {
+        result.output = execFileSync("bash", ["-c", commitStep.run], {
+          cwd: workspace,
+          env: {
+            ...process.env,
+            DEST_PATH: "out/example",
+            GIT_LITERAL_PATHSPECS: "1",
+            BRANCH_REF: "x",
+            COMMIT_MESSAGE: "m",
+            EXPECTED_HEAD_SHA: "a".repeat(40),
+            GH_TOKEN: "fake",
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        }).toString();
+      } catch (e) {
+        result.code = e.status;
+        result.output = String(e.stdout || "") + String(e.stderr || "");
+      }
+      return result;
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  };
+
+  const withGitDir = runCommit((ws) => {
+    fs.mkdirSync(path.join(ws, "out/example/.git"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "out/example/.git/config"), "x");
+    fs.writeFileSync(path.join(ws, "out/example/real.txt"), "y");
+  });
+  assert.equal(withGitDir.code, 1, "a .git directory inside the artifact must be rejected");
+  assert.match(withGitDir.output, /contains \.git entries/);
+
+  // Regression: an artifact with no .git entries must reach past this
+  // check (it will fail later, on the push, for unrelated reasons in this
+  // sandboxed test -- what matters is it does NOT fail on the .git check).
+  const clean = runCommit((ws) => {
+    fs.mkdirSync(path.join(ws, "out/example"), { recursive: true });
+    fs.writeFileSync(path.join(ws, "out/example/real.txt"), "y");
+  });
+  assert.doesNotMatch(clean.output, /contains \.git entries/);
+});
+
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
   assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);
