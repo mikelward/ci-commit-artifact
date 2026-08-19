@@ -45,6 +45,20 @@ test("flow sequence splitting: a doubled '' inside a single-quoted element doesn
   assert.deepEqual(doc.a, ["x'y,z", "q"]);
 });
 
+test("flow sequence splitting: a quote mid-element has no quoting effect — only an element's OWN first character can start one", () => {
+  // Same restriction as the sibling stripInlineComment test, applied to
+  // flow-sequence elements: verified against
+  // yaml.safe_load('a: [echo "hi, x", b]\n') ->
+  // {'a': ['echo "hi', 'x"', 'b']} — three elements, not one long quoted
+  // element swallowing the comma. Contrast with the genuinely-quoted
+  // ["x, y", b] case, which still protects its internal comma because the
+  // quote IS that element's first character.
+  const doc = parseWorkflowYaml(String.raw`a: [echo "hi, x", b]` + "\n");
+  assert.deepEqual(doc.a, ['echo "hi', 'x"', "b"]);
+  const doc2 = parseWorkflowYaml(String.raw`a: ["x, y", b]` + "\n");
+  assert.deepEqual(doc2.a, ["x, y", "b"]);
+});
+
 test("parses a block sequence of mappings (- key: value siblings)", () => {
   const doc = parseWorkflowYaml(
     "steps:\n  - name: one\n    run: echo hi\n  - name: two\n    run: echo bye\n",
@@ -75,6 +89,21 @@ test("strips an inline comment from a plain scalar, but not a # inside a quoted 
   assert.equal(doc.b, "it's # not a comment");
   assert.equal(doc.c, "a # b");
   assert.equal(doc.d, "value#no-space-before-hash-is-not-a-comment");
+});
+
+test("a quote mid-plain-scalar has no quoting effect — only a scalar's OWN first character can start one", () => {
+  // Verified against yaml.safe_load('a: echo "x # y"\n') -> {'a': 'echo "x'}
+  // — a shell-quoted substring inside an otherwise-plain scalar (`run: echo
+  // "x # y"`, extremely common) is not a YAML-quoted scalar at all. The
+  // embedded " is a literal character with no special meaning, and # still
+  // starts a comment by the ordinary preceded-by-whitespace rule. Contrast
+  // with c: "a # b" above, where the SAME text is genuinely quoted because
+  // the value itself starts with the quote character.
+  const doc = parseWorkflowYaml(
+    String.raw`a: echo "x # y"` + "\n" + "b: echo 'x # y'\n",
+  );
+  assert.equal(doc.a, 'echo "x');
+  assert.equal(doc.b, "echo 'x");
 });
 
 test("distinguishes single- and double-quoted scalars, unescaping each", () => {
