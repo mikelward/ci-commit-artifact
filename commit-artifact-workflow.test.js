@@ -101,11 +101,37 @@ test("fails fast, before checkout, when comment-marker or dispatch-workflow is s
   assert.ok(validateIdx > -1, "no validation step found");
   assert.ok(validateIdx < checkoutIdx, "validation must run before checkout, not after");
   const validate = steps[validateIdx];
+  // The step's own if: only decides whether it runs at ALL (skip the check
+  // entirely for a caller that sets none of the three inputs) — the actual
+  // missing-pr-number logic now lives in the run: block, alongside the
+  // format check below, so both conditions get their own named error.
   assert.match(
     validate.if,
-    /\(inputs\.comment-marker != '' \|\| inputs\.dispatch-workflow != ''\) && inputs\.pr-number == ''/,
+    /inputs\.pr-number != '' \|\| inputs\.comment-marker != '' \|\| inputs\.dispatch-workflow != ''/,
+  );
+  assert.match(
+    validate.run,
+    /\[ -z "\$PR_NUMBER" \] && \{ \[ -n "\$COMMENT_MARKER" \] \|\| \[ -n "\$DISPATCH_WORKFLOW" \]; \}/,
   );
   assert.match(validate.run, /exit 1/);
+});
+
+test("fails fast on a pr-number that isn't a positive integer", () => {
+  // Number('abc') is NaN; every downstream use of PR_NUMBER (the freshness
+  // comment's github.rest.pulls.get, the dispatch step's -f pr=) fails or
+  // misbehaves far from here, and the freshness comment's own API errors
+  // are caught into a silent skip by design (continue-on-error, for genuine
+  // API hiccups) — which would otherwise hide a caller typo behind the same
+  // "no comment posted" symptom as a transient failure.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.match(
+    validate.run,
+    /\[ -n "\$PR_NUMBER" \] && ! \[\[ "\$PR_NUMBER" =~ \^\[1-9\]\[0-9\]\*\$ \]\]/,
+  );
+  // Never spliced directly — same reasoning as every other PR-influenced
+  // input in this file.
+  assert.equal(validate.env.PR_NUMBER, "${{ inputs.pr-number }}");
 });
 
 test("refuses to rm -rf a dest-path that isn't a safe relative path inside the checkout", () => {
@@ -304,16 +330,29 @@ test("the freshness comment re-checks the PR's live head before writing a DOWNLO
   // even a stale "download failed"/"commit failed"/"up-to-date" overwriting
   // a fresh, accurate comment, with no further push coming to correct it.
   const script = step("Comment freshness on the PR").with.script;
+  const paginateIdx = script.indexOf("github.paginate(github.rest.issues.listComments");
   const pullsGetIdx = script.indexOf("github.rest.pulls.get(");
   const mismatchIdx = script.indexOf("pr.data.head.sha !== process.env.HEAD_SHA");
   const updateIdx = script.indexOf("github.rest.issues.updateComment(");
   const createIdx = script.indexOf("github.rest.issues.createComment(");
+  assert.ok(paginateIdx > -1, "no comment-listing call found in the freshness script");
   assert.ok(pullsGetIdx > -1, "no live-head re-fetch found in the freshness script");
   assert.ok(mismatchIdx > -1, "no HEAD_SHA mismatch check found in the freshness script");
   assert.ok(updateIdx > -1 && createIdx > -1);
   assert.ok(
     pullsGetIdx < mismatchIdx && mismatchIdx < updateIdx && mismatchIdx < createIdx,
     "the live-head check must run, and be evaluated, before either comment-write call — or a stale run could still overwrite a fresher one",
+  );
+  // The GitHub REST API has no conditional-write primitive for issue
+  // comments, so the closest approximation to atomicity with the write is
+  // running the re-check AFTER the (potentially multi-request, paginated)
+  // comment-listing call rather than before it — that's the dominant
+  // contributor to the async gap between "confirmed current" and "actually
+  // wrote". Checking first and listing second would leave the whole
+  // listComments await unguarded.
+  assert.ok(
+    paginateIdx < pullsGetIdx,
+    "the comment-listing call must happen BEFORE the live-head re-check, not after — checking first only to await listComments afterward leaves that whole window unguarded",
   );
   // Never spliced directly into the run: block — same injection concern as
   // every other PR-influenced value in this file (see the sibling test

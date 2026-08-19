@@ -129,17 +129,40 @@ jobs:
       commit_sha: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
     steps:
       - name: Validate the input combination
-        # Fails fast, before checkout or any real work: both comment-marker's
-        # freshness comment and dispatch-workflow's `-f pr="$PR_NUMBER"` need
-        # a real PR number, and the steps that use them silently no-op or
-        # pass an empty string when pr-number is '' — a caller that set
-        # either without pr-number would otherwise see a quiet failure
-        # (missing comment, or a dispatch call carrying no PR) instead of a
-        # clear reason why.
-        if: (inputs.comment-marker != '' || inputs.dispatch-workflow != '') && inputs.pr-number == ''
+        # Fails fast, before checkout or any real work. Two independent
+        # things can be wrong with pr-number, checked separately so the
+        # error names the actual mistake:
+        #   - it's '' while comment-marker's freshness comment or
+        #     dispatch-workflow's `-f pr="$PR_NUMBER"` needs a real one —
+        #     both silently no-op or pass an empty string otherwise, which a
+        #     caller would only discover as a quiet failure (missing
+        #     comment, or a dispatch call carrying no PR).
+        #   - it's non-empty but not actually a PR number (e.g. a typo'd
+        #     'true', a stray quote). Number('abc') is NaN, and every
+        #     downstream use of it (github.rest.pulls.get, gh workflow run
+        #     -f pr=) fails or misbehaves far from here — the freshness
+        #     comment's own API errors are caught and swallowed into a
+        #     silent skip (continue-on-error, by design, for genuine API
+        #     hiccups), which would hide a caller misconfiguration behind
+        #     the same "no comment posted" symptom as a transient failure.
+        # Only runs when there's something to check — this step's own `if:`
+        # keeps a caller that never sets any of these three inputs from
+        # paying for it.
+        if: inputs.pr-number != '' || inputs.comment-marker != '' || inputs.dispatch-workflow != ''
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          COMMENT_MARKER: ${{ inputs.comment-marker }}
+          DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
         run: |
-          echo "::error::pr-number is '' but comment-marker or dispatch-workflow is set — both need a PR to act on. Pass pr-number, or clear comment-marker/dispatch-workflow to skip them."
-          exit 1
+          set -euo pipefail
+          if [ -z "$PR_NUMBER" ] && { [ -n "$COMMENT_MARKER" ] || [ -n "$DISPATCH_WORKFLOW" ]; }; then
+            echo "::error::pr-number is '' but comment-marker or dispatch-workflow is set — both need a PR to act on. Pass pr-number, or clear comment-marker/dispatch-workflow to skip them."
+            exit 1
+          fi
+          if [ -n "$PR_NUMBER" ] && ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pr-number must be a positive integer, got '$PR_NUMBER'"
+            exit 1
+          fi
 
       - name: Check out the branch
         id: checkout
@@ -323,6 +346,14 @@ jobs:
             const prNumber = Number(process.env.PR_NUMBER);
 
             let status;
+            // Set only in the "guard confirmed the branch was genuinely at
+            // expected-head-sha" branch below — the one branch where a
+            // live-head re-check right before writing is both meaningful
+            // (HEAD_SHA is a reliable stand-in for what this run's report is
+            // about) and necessary (an early-failure or SKIPPED report must
+            // post unconditionally, or reintroduce the bugs those two fixes
+            // just closed).
+            let needsLiveHeadCheck = false;
             // checkout/guard/clear all run unconditionally (or nearly so —
             // guard has no if: at all, clear only requires guard to have
             // already succeeded with skip!='true'), so a non-success outcome
@@ -360,24 +391,17 @@ jobs:
               // when THIS run checked it, so HEAD_SHA (this run's own new
               // commit if it made one, else that confirmed head) is now a
               // reliable stand-in for "what this run's report is about" —
-              // safe to re-check against the PR's LIVE head right before
-              // writing. Overlapping runs are expected (cancel-in-progress
-              // is asynchronous), so an older run can still reach this step
-              // after a newer run, triggered by a later push, already
-              // posted its own accurate status; without this, whichever
-              // comment write finishes LAST wins even when reporting on a
-              // push that's no longer the PR's head, and nothing ever
-              // corrects a stale status left behind that way.
-              try {
-                const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
-                if (pr.data.head.sha !== process.env.HEAD_SHA) {
-                  core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
-                  return;
-                }
-              } catch (e) {
-                core.warning(`Could not confirm the PR's current head (${e.message}); skipping the freshness comment rather than risking overwriting a newer, accurate one.`);
-                return;
-              }
+              // worth re-checking against the PR's LIVE head right before
+              // writing (done below, as late as possible — see the comment
+              // there for why not here). Overlapping runs are expected
+              // (cancel-in-progress is asynchronous), so an older run can
+              // still reach this step after a newer run, triggered by a
+              // later push, already posted its own accurate status;
+              // without a check like this, whichever comment write
+              // finishes LAST wins even when reporting on a push that's no
+              // longer the PR's head, and nothing ever corrects a stale
+              // status left behind that way.
+              needsLiveHeadCheck = true;
 
               if (process.env.DOWNLOAD_OUTCOME !== 'success') {
                 // Ambiguous by construction (see the download step's own
@@ -418,6 +442,31 @@ jobs:
               return;
             }
             const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+
+            // Re-checked here — as the LAST thing before writing, after
+            // listComments has already resolved — rather than once up top
+            // before any of the above. The GitHub REST API has no
+            // conditional-write primitive for issue comments (no ETag/If-
+            // Match support to reject a write racing a concurrent one), so
+            // full atomicity with the write itself isn't available; doing
+            // the check first and the write last is the closest approximation
+            // — it closes the largest realistic contributor to the gap (the
+            // listComments await, which can be several paginated round
+            // trips), leaving only the width of the write call itself,
+            // which no amount of client-side reordering can close further.
+            if (needsLiveHeadCheck) {
+              try {
+                const pr = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+                if (pr.data.head.sha !== process.env.HEAD_SHA) {
+                  core.info(`PR head is now ${pr.data.head.sha}, not this run's ${process.env.HEAD_SHA} — a newer run supersedes this report. Skipping the freshness comment.`);
+                  return;
+                }
+              } catch (e) {
+                core.warning(`Could not confirm the PR's current head (${e.message}); skipping the freshness comment rather than risking overwriting a newer, accurate one.`);
+                return;
+              }
+            }
+
             try {
               if (existing) {
                 await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
