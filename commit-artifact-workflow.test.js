@@ -260,7 +260,7 @@ test("refuses to rm -rf a dest-path that isn't a safe relative path inside the c
   assert.doesNotMatch(clearStep.run, /rm -rf -- "\$DEST_PATH"/);
 });
 
-test("rejects a tilde-prefixed dest-path before it ever reaches download-artifact", () => {
+test("rejects any dest-path starting with a tilde before it ever reaches download-artifact", () => {
   // Real Codex finding, verified against actions/download-artifact's own
   // source before fixing: this step's `realpath -m` never expands a
   // leading '~' (it's a plain canonicalizer, not a shell), so "~/foo"
@@ -271,8 +271,16 @@ test("rejects a tilde-prefixed dest-path before it ever reaches download-artifac
   // inputs.path.replace('~', os.homedir())`) expands it to the runner's
   // real home directory. What gets validated and what actually receives
   // the artifact would silently be two different paths.
+  //
+  // A first version of this fix only rejected an exact "~" or "~/..." --
+  // a second real finding on that revision: startsWith('~') is true for
+  // ANY leading tilde, slash or not, and `.replace('~', X)` is a plain
+  // substring swap with no separator inserted, so "~snapshots" becomes
+  // homedir+"snapshots" concatenated directly (verified with the actual
+  // JS replace before widening the shell pattern) -- a value the
+  // narrower "~"|"~"/* pattern let straight through.
   const clearStep = step("Empty the destination before extracting the artifact");
-  assert.match(clearStep.run, /"~"\|"~"\/\*/, "should reject a bare or slash-prefixed tilde");
+  assert.match(clearStep.run, /"~"\*/, "should reject any leading tilde, not just a bare or slash-prefixed one");
 
   const runClear = (destPath) => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "tilde-reject-"));
@@ -299,6 +307,9 @@ test("rejects a tilde-prefixed dest-path before it ever reaches download-artifac
   const prefixed = runClear("~/evil");
   assert.equal(prefixed.code, 1, "a '~/...' dest-path must be rejected");
   assert.match(prefixed.output, /dest-path must be a non-empty path/);
+  const noSlash = runClear("~snapshots");
+  assert.equal(noSlash.code, 1, "a '~name' dest-path with no slash must be rejected too");
+  assert.match(noSlash.output, /dest-path must be a non-empty path/);
   // Regression: a tilde NOT at the very start is not expanded by
   // download-artifact's own check (a plain `startsWith('~')`), so it must
   // not be rejected here either.

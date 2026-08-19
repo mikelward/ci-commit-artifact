@@ -283,10 +283,19 @@ jobs:
         # source before fixing) expands it to the runner's real home
         # directory. What gets validated and what actually receives the
         # artifact would silently be two different paths.
+        #
+        # Rejecting just "~" and "~/..." wasn't enough: startsWith('~') is
+        # true for ANY leading tilde, slash or not, and `.replace('~', X)`
+        # is a plain substring swap with no separator inserted — so
+        # "~snapshots" becomes homedir+"snapshots" concatenated directly
+        # (e.g. "/home/runnersnapshots"), a broken but still non-checkout
+        # path that the earlier, narrower pattern let straight through.
+        # Verified directly (both the shell match and the actual JS
+        # replace) before widening this to reject any leading '~' at all.
         run: |
           set -euo pipefail
           case "$DEST_PATH" in
-            ""|.|/|/*|"~"|"~"/*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
+            ""|.|/|/*|"~"*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
           esac
           resolved=$(cd "$GITHUB_WORKSPACE" && realpath -m -- "$DEST_PATH")
           # dest-path's STRING is owner-configured, but whatever's actually
