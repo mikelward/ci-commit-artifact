@@ -349,6 +349,20 @@ function parseWorkflowYaml(text) {
       if (ch === "[") depth++;
       if (ch === "]") depth--;
       if (ch === "," && depth === 0) {
+        // An empty element (two commas in a row, or a leading comma) is
+        // invalid — verified against yaml.safe_load, which raises a
+        // ParserError for "[a,,b]", "[,a,b]" and "[a, ,b]" alike. A SINGLE
+        // trailing comma ("[a,b,]") is valid and never reaches this throw:
+        // it splits off "b" here (current is non-empty at that point) and
+        // the resulting empty tail is dropped below, after the loop, by
+        // the trim() check that already existed — this only rejects an
+        // element that is empty at a SPLIT point, not the harmless nothing
+        // that follows the sequence's own last comma.
+        if (current.trim() === "") {
+          throw new Error(
+            `yaml-lite: empty element in flow sequence (got ${JSON.stringify(`[${inner}]`)})`,
+          );
+        }
         parts.push(current);
         current = "";
         continue;
