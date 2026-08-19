@@ -334,6 +334,26 @@ test("throws on a surplus closing bracket, not just a missing one", () => {
   assert.deepEqual(doc.foo, [["a"], ["b"]]);
 });
 
+test("hasBalancedFlowBrackets ignores a mid-scalar quote — only an element's OWN first character opens one", () => {
+  // 'a: [echo "x]y", q]' previously entered synthetic quote mode at the
+  // mid-scalar '"' (not that element's own first character), swallowing
+  // the REAL closing "]" right after "x" into the "quoted" run and
+  // reading the whole thing as a balanced two-element sequence —
+  // ["echo \"x]y\", q"]. Verified against yaml.safe_load, which rejects
+  // this outright ("while parsing a block mapping"): the same
+  // element-start restriction splitFlowSequence already applies to
+  // quote-opening (see the sibling "a quote mid-element has no quoting
+  // effect" test) had to be applied here too.
+  assert.throws(
+    () => parseWorkflowYaml(String.raw`a: [echo "x]y", q]` + "\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // Contrast: a quote that IS an element's own first character still
+  // protects a bracket inside it, same as before this fix.
+  const doc = parseWorkflowYaml(String.raw`a: ["x]y", q]` + "\n");
+  assert.deepEqual(doc.a, ["x]y", "q"]);
+});
+
 test("throws on an empty element in a flow sequence, while still allowing a single trailing comma", () => {
   // "[ubuntu-latest,,other]" (two commas in a row) pushed an empty
   // `current` at the second comma, and parseScalar turned that empty

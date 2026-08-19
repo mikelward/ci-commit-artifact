@@ -27,3 +27,20 @@ known to be wrong today, just fragile in the same way this one was.
 Python-based repos (`web`) are a separate case: PyYAML is a genuine
 zero-cost option there since Python is already the production runtime, not
 a second runtime taken on for test convenience the way it would be here.
+
+## Remaining forbidden plain-scalar starters in yaml-lite.js
+
+`parseScalar` now rejects a plain scalar that opens with `&`/`*` (anchors/
+aliases), `!` (tags), `@`/`` ` ``/`%` (reserved indicators), a genuinely
+unterminated quote, and an unquoted `: ` or trailing `:`. YAML's own
+reserved-indicator list is longer than the three characters covered so far
+— a leading `]`, `,`, `}`, and the whitespace-sensitive `-`/`?` (only
+reserved when followed by a space or end-of-line, same shape of rule as the
+`:` check) are still silently accepted as plain-scalar text. Deferred rather
+than folded into the PR that landed the `@`/`` ` ``/`%` check: this repo's
+own workflow and README round-trip tests (the actual thing this parser
+exists to protect) don't exercise any of these shapes, and each one so far
+has needed its own real-YAML verification round rather than a batch
+guess — see the git history of `yaml-lite.js` for the pattern. Land the
+rest together in one pass, verified against `yaml.safe_load` for each
+character, next time this file is touched for an unrelated reason.
