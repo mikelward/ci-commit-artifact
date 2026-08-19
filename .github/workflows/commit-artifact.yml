@@ -176,6 +176,7 @@ jobs:
         #     hiccups), which would hide a caller misconfiguration behind
         #     the same "no comment posted" symptom as a transient failure.
         env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
           BRANCH_REF: ${{ inputs.branch-ref }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
@@ -183,6 +184,16 @@ jobs:
           DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
         run: |
           set -euo pipefail
+          # actions/download-artifact reads `!!inputs.name` to decide whether
+          # this is a single-artifact download — an empty string is exactly
+          # as falsy as an omitted input, so it falls into the "download
+          # every artifact" path instead of failing on a name that doesn't
+          # exist. Verified against the action's own source
+          # (actions/download-artifact, download-artifact.ts) before fixing.
+          if [ -z "$ARTIFACT_NAME" ]; then
+            echo "::error::artifact-name is '' — download-artifact would silently download every artifact in the run instead of failing on a missing one. Check the caller's expression."
+            exit 1
+          fi
           if [ -z "$BRANCH_REF" ]; then
             echo "::error::branch-ref is '' — checkout would silently fall back to the triggering event's own ref instead of failing. Check the caller's expression (e.g. github.event.pull_request.head.ref is empty on events without a pull_request context)."
             exit 1
@@ -260,10 +271,22 @@ jobs:
         # directory, up to and including the checkout's own .git. Cheap to
         # rule out, and a typo in a caller's `with:` block is a more
         # realistic way to hit this than anything adversarial.
+        #
+        # A leading '~' gets the same rejection for a sharper reason: this
+        # step's own `realpath -m` never expands it (it's a plain
+        # canonicalizer, not a shell), so "~/foo" validates here as the
+        # literal, harmless subdirectory $GITHUB_WORKSPACE/~/foo — but the
+        # LATER "Download the artifact" step hands the raw, unvalidated
+        # dest-path string to actions/download-artifact's `path:` input,
+        # whose own code (`if (inputs.path.startsWith('~')) inputs.path =
+        # inputs.path.replace('~', os.homedir())` — confirmed against its
+        # source before fixing) expands it to the runner's real home
+        # directory. What gets validated and what actually receives the
+        # artifact would silently be two different paths.
         run: |
           set -euo pipefail
           case "$DEST_PATH" in
-            ""|.|/|/*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
+            ""|.|/|/*|"~"|"~"/*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
           esac
           resolved=$(cd "$GITHUB_WORKSPACE" && realpath -m -- "$DEST_PATH")
           # dest-path's STRING is owner-configured, but whatever's actually
