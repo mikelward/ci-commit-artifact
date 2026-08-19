@@ -86,8 +86,19 @@ function parseWorkflowYaml(text) {
   // never mistaken for one. YAML's own rule is the same: a comment starts
   // at a `#` that is either the first character or preceded by whitespace,
   // and is outside any quoted scalar.
+  //
+  // Quoting is a property of how the WHOLE scalar begins, not of any
+  // character appearing partway through it — verified against
+  // yaml.safe_load("a: echo \"x # y\"\n") -> {'a': 'echo "x'}, not the
+  // whole string with the # preserved. A plain scalar with a shell-quoted
+  // substring (`run: echo "x # y"`, extremely common) is not a quoted
+  // scalar at all: the embedded " has no special meaning, and # still
+  // starts a comment by the ordinary preceded-by-whitespace rule. `quote`
+  // may only be entered while `sawNonSpace` is still false — i.e. at the
+  // scalar's own first non-whitespace character.
   function stripInlineComment(text) {
     let quote = null;
+    let sawNonSpace = false;
     for (let i = 0; i < text.length; i++) {
       const ch = text[i];
       if (quote) {
@@ -102,10 +113,12 @@ function parseWorkflowYaml(text) {
         }
         continue;
       }
-      if (ch === "'" || ch === '"') {
+      if (!sawNonSpace && (ch === "'" || ch === '"')) {
         quote = ch;
+        sawNonSpace = true;
         continue;
       }
+      if (!/\s/.test(ch)) sawNonSpace = true;
       if (ch === "#" && (i === 0 || /\s/.test(text[i - 1]))) {
         return text.slice(0, i);
       }
@@ -166,7 +179,14 @@ function parseWorkflowYaml(text) {
         }
         continue;
       }
-      if (ch === "'" || ch === '"') {
+      // Same restriction as stripInlineComment, for the same reason: a
+      // quote only starts a quoted ELEMENT when it's that element's own
+      // first character (nothing but whitespace accumulated since the
+      // last split point), not wherever one happens to appear —
+      // `[echo "hi, x", b]` is a plain scalar `echo "hi` split at the
+      // embedded comma the same as GitHub's own parser, not one long
+      // quoted element. Verified against yaml.safe_load.
+      if ((ch === "'" || ch === '"') && current.trim() === "") {
         quote = ch;
         current += ch;
         continue;
