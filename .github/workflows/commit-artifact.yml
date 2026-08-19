@@ -1,0 +1,383 @@
+name: commit-artifact
+
+# The reusable half of the "commit rendered output back to a PR branch"
+# pattern — see README.md for what this is and AGENTS.md for why it's
+# structured as a separate clean job rather than a hardened one.
+#
+# Call this as a job (`uses:`, not a step) from a job that `needs:` the one
+# that renders and uploads the artifact. Jobs inside a called reusable
+# workflow share the calling workflow's run, so `download-artifact` here can
+# see an artifact an earlier job in the CALLER uploaded — no need to pass the
+# rendered content through `inputs` (which only accepts strings/numbers/
+# booleans, not files).
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: >-
+          Name of the workflow artifact — uploaded by an earlier job in the
+          calling workflow via actions/upload-artifact — to commit. Must
+          exist: this job fails if it can't be downloaded, rather than
+          silently skipping. actions/upload-artifact can't represent a
+          genuinely empty render as a real artifact, so if yours can
+          legitimately produce zero files, upload a placeholder for that
+          case instead of relying on if-no-files-found: ignore.
+        required: true
+        type: string
+      dest-path:
+        description: >-
+          Path, relative to the repo root, that the artifact's contents
+          replace. Anything already committed under this path that the
+          artifact doesn't recreate is removed (git add -A on this path).
+        required: true
+        type: string
+      commit-message:
+        description: Commit subject for the regenerated content.
+        required: true
+        type: string
+      branch-ref:
+        description: >-
+          Branch to check out and push to — normally
+          github.event.pull_request.head.ref. Same-repo PRs only: this
+          workflow always checks out and pushes to the CALLER's own
+          repository, authenticated with the caller's GITHUB_TOKEN. Gate the
+          calling job on github.event.pull_request.head.repo.full_name ==
+          github.repository before invoking it for a fork PR — the branch
+          won't exist here at all (checkout fails loudly), UNLESS the base
+          repo happens to have a same-named branch, in which case this would
+          silently check out and commit to the wrong branch instead.
+        required: true
+        type: string
+      expected-head-sha:
+        description: >-
+          The commit the artifact was rendered against — normally
+          github.event.pull_request.head.sha, captured by the caller at
+          trigger time. If branch-ref has since moved past this, the commit
+          is skipped: cancel-in-progress is asynchronous, so a push between
+          when the render job started and this job running doesn't stop the
+          render job first, it just moves the branch tip out from under it.
+          Committing the old render onto the new tip would be silently
+          wrong, not merely stale — the run the newer push triggers renders
+          and commits for real.
+        required: true
+        type: string
+      pr-number:
+        description: >-
+          Pull request number. Required only if dispatch-workflow or
+          comment-marker is set; pass '' otherwise.
+        required: false
+        type: string
+        default: ''
+      dispatch-workflow:
+        description: >-
+          Workflow file to dispatch on branch-ref after a successful push
+          (e.g. ci.yml), so the caller's required checks report on the new
+          commit — a GITHUB_TOKEN-authored push starts no workflow run on
+          its own. Needs a `workflow_dispatch` trigger with a `pr` input on
+          the CALLER's default branch (GitHub can't dispatch a workflow file
+          it can't see there, however branch-ref itself spells it). Leave
+          '' to skip dispatching.
+        required: false
+        type: string
+        default: ''
+      comment-marker:
+        description: >-
+          HTML comment marker (e.g. '<!-- my-artifact-status -->') for a
+          sticky, upserted PR comment reporting whether this run committed
+          anything. Leave '' to skip posting one.
+        required: false
+        type: string
+        default: ''
+      artifact-noun:
+        description: >-
+          Human-readable plural noun for what the artifact holds, used only
+          in the freshness comment (e.g. "UI snapshot"). Ignored if
+          comment-marker is ''.
+        required: false
+        type: string
+        default: 'file'
+    outputs:
+      committed:
+        description: >-
+          'true' if a commit was pushed, 'false' if there was nothing to
+          commit or branch-ref had moved past expected-head-sha.
+        value: ${{ jobs.commit.outputs.committed }}
+      commit-sha:
+        description: >-
+          The resulting head of branch-ref: the new commit if one was
+          pushed, otherwise its unchanged current head.
+        value: ${{ jobs.commit.outputs.commit_sha }}
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    # Declared explicitly as a ceiling, not left to inherit whatever the
+    # caller's own workflow-level grant happens to be — a reusable
+    # workflow's job permissions are honored but capped by the caller, never
+    # widened past it, so this is the actual limit this job runs under.
+    permissions:
+      contents: write # push the commit
+      pull-requests: write # freshness comment
+      actions: write # download-artifact read + workflow dispatch
+    outputs:
+      # Falls back to 'false' when the commit step was skipped entirely (a
+      # moved branch, or a failed/missing download) — steps.commit.outputs.committed
+      # is unset in that case, and the documented contract promises 'false'
+      # there, not an empty string a caller's == 'false' check would miss.
+      committed: ${{ steps.commit.outputs.committed || 'false' }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
+    steps:
+      - name: Validate the input combination
+        # Fails fast, before checkout or any real work: both comment-marker's
+        # freshness comment and dispatch-workflow's `-f pr="$PR_NUMBER"` need
+        # a real PR number, and the steps that use them silently no-op or
+        # pass an empty string when pr-number is '' — a caller that set
+        # either without pr-number would otherwise see a quiet failure
+        # (missing comment, or a dispatch call carrying no PR) instead of a
+        # clear reason why.
+        if: (inputs.comment-marker != '' || inputs.dispatch-workflow != '') && inputs.pr-number == ''
+        run: |
+          echo "::error::pr-number is '' but comment-marker or dispatch-workflow is set — both need a PR to act on. Pass pr-number, or clear comment-marker/dispatch-workflow to skip them."
+          exit 1
+
+      - name: Check out the branch
+        id: checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.branch-ref }}
+          # Full history, not just this ref: the caller may want commit_sha
+          # compared against a base elsewhere, and a shallow clone here would
+          # be a false economy on a job this cheap.
+          fetch-depth: 0
+          # Nothing in this job has executed anything from the pull request
+          # — that's this whole workflow's reason to exist (see AGENTS.md) —
+          # so there is no untrusted code in reach of a persisted credential
+          # to begin with. False anyway: the commit/push step below
+          # authenticates through an explicit token URL, never this
+          # checkout's credential.
+          persist-credentials: false
+
+      - name: Refuse to act on an untested branch head
+        id: guard
+        env:
+          # git's check-ref-format allows characters like ', $, ;, |, & and
+          # backticks in a branch name, so a same-repo collaborator could
+          # name their branch to inject shell code if this were expanded
+          # directly into the script below. As env vars, both values reach
+          # the shell as data.
+          BRANCH_REF: ${{ inputs.branch-ref }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        run: |
+          set -euo pipefail
+          actual_head_sha=$(git rev-parse HEAD)
+          echo "actual_head_sha=$actual_head_sha" >> "$GITHUB_OUTPUT"
+          if [ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::warning::$BRANCH_REF advanced to $actual_head_sha since the artifact was rendered against $EXPECTED_HEAD_SHA — skipping; the run triggered by that push renders and commits against it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Empty the destination before extracting the artifact
+        id: clear
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          DEST_PATH: ${{ inputs.dest-path }}
+        # download-artifact EXTRACTS into dest-path, it doesn't replace it —
+        # a file the new render dropped (an orphaned snapshot, say) would
+        # otherwise sit there untouched, `git add -A` would see it as
+        # unchanged, and the "artifact's contents replace dest-path"
+        # contract in the artifact-name input's own description would be
+        # false for exactly the case that matters (a deletion). Clearing
+        # first makes the directory's final content always equal to
+        # whatever the artifact actually contains, deletions included.
+        #
+        # dest-path is owner-configured (set in each caller's own workflow
+        # YAML, never derived from PR content), but this rm -rf is validated
+        # before running regardless: an absolute path, '.', or anything that
+        # resolves outside the checkout — including via a '..' escape —
+        # would delete far more than the intended generated-output
+        # directory, up to and including the checkout's own .git. Cheap to
+        # rule out, and a typo in a caller's `with:` block is a more
+        # realistic way to hit this than anything adversarial.
+        run: |
+          set -euo pipefail
+          case "$DEST_PATH" in
+            ""|.|/|/*) echo "::error::dest-path must be a non-empty path relative to the checkout root, not '$DEST_PATH'"; exit 1 ;;
+          esac
+          resolved=$(cd "$GITHUB_WORKSPACE" && realpath -m -- "$DEST_PATH")
+          case "$resolved" in
+            "$GITHUB_WORKSPACE")
+              echo "::error::dest-path resolves to the checkout root ($resolved) — refusing to delete it"; exit 1 ;;
+            "$GITHUB_WORKSPACE"/.git|"$GITHUB_WORKSPACE"/.git/*)
+              echo "::error::dest-path resolves inside .git ($resolved) — refusing to delete it"; exit 1 ;;
+            "$GITHUB_WORKSPACE"/*)
+              : ;;
+            *)
+              echo "::error::dest-path resolves outside the checkout: $resolved"; exit 1 ;;
+          esac
+          rm -rf -- "$DEST_PATH"
+
+      - name: Download the artifact
+        id: download
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.dest-path }}
+        # Fails the job LOUDLY, on purpose — no continue-on-error. A missing
+        # artifact and a genuinely empty render are indistinguishable from
+        # here (actions/upload-artifact cannot represent "zero files" as a
+        # real artifact at all, so a caller whose render can legitimately
+        # produce nothing must still upload a placeholder for that case), but
+        # guessing wrong in either direction is worse than asking: treating a
+        # missing artifact as "nothing to do" would silently drop a real
+        # deletion (dest-path was already emptied above, so the loss would be
+        # invisible until someone noticed stale content never went away);
+        # treating it as fatal at least says so, on the exact run where it
+        # happened, with GitHub's own "artifact not found" error attached.
+
+      - name: Commit and push
+        id: commit
+        if: steps.guard.outputs.skip != 'true' && steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Same reasoning as the guard step: none of these are safe to
+          # splice directly into the script.
+          BRANCH_REF: ${{ inputs.branch-ref }}
+          DEST_PATH: ${{ inputs.dest-path }}
+          COMMIT_MESSAGE: ${{ inputs.commit-message }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- "$DEST_PATH"
+          if git diff --cached --quiet; then
+            echo "No changes under $DEST_PATH."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -q -m "$COMMIT_MESSAGE"
+          # Explicit URL, not the `origin` remote name: this checkout never
+          # ran anything untrusted (see the checkout step above), so there's
+          # nothing to defend `origin.url` against here — this is just the
+          # simplest way to authenticate a push without persisting a
+          # credential in .git/config for the rest of the job to carry.
+          #
+          # --force-with-lease pinned to the exact SHA the guard step already
+          # verified branch-ref was at: a plain push is a no-op safety check
+          # against a moved branch (any fast-forward succeeds, including one
+          # from a branch that was deleted and recreated, or force-reset
+          # backward, between the guard running and this step reaching the
+          # push — the new commit's parent is still an ancestor either way,
+          # so it would silently resurrect or undo whatever the intervening
+          # change was doing). The lease makes the push fail instead of
+          # guessing whenever the remote ref isn't still exactly what the
+          # guard saw.
+          git push --force-with-lease="$BRANCH_REF:$EXPECTED_HEAD_SHA" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$BRANCH_REF"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch CI on the new commit
+        if: steps.commit.outputs.committed == 'true' && inputs.dispatch-workflow != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_REF: ${{ inputs.branch-ref }}
+          DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -euo pipefail
+          if ! gh workflow run "$DISPATCH_WORKFLOW" --ref "$BRANCH_REF" -f pr="$PR_NUMBER"; then
+            echo "::error::Pushed to $BRANCH_REF but could not dispatch $DISPATCH_WORKFLOW on it (does it have workflow_dispatch with a pr input, on the default branch?). Dispatch it by hand from the Actions tab."
+            exit 1
+          fi
+
+      - name: Comment freshness on the PR
+        if: always() && inputs.comment-marker != '' && inputs.pr-number != ''
+        # A GitHub API hiccup posting a convenience comment must not turn an
+        # otherwise-successful commit/push red. The catch below still warns,
+        # so a missing comment always has a reason in the log.
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          COMMENT_MARKER: ${{ inputs.comment-marker }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_NOUN: ${{ inputs.artifact-noun }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          GUARD_OUTCOME: ${{ steps.guard.outcome }}
+          CLEAR_OUTCOME: ${{ steps.clear.outcome }}
+          SKIPPED: ${{ steps.guard.outputs.skip }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          COMMIT_OUTCOME: ${{ steps.commit.outcome }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
+          HEAD_SHA: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
+        with:
+          script: |
+            const marker = process.env.COMMENT_MARKER;
+            const noun = process.env.ARTIFACT_NOUN;
+            const headSha = (process.env.HEAD_SHA || '').slice(0, 7);
+            let status;
+            // checkout/guard/clear all run unconditionally (or nearly so —
+            // guard has no if: at all, clear only requires guard to have
+            // already succeeded with skip!='true'), so a non-success outcome
+            // from any of them means the job failed BEFORE the download step
+            // ever got a chance to run — distinct from download itself
+            // failing or finding nothing, which the next branch reports.
+            // Without this check that case fell through to "artifact wasn't
+            // available", which blames the wrong step.
+            if (process.env.CHECKOUT_OUTCOME !== 'success' || process.env.GUARD_OUTCOME !== 'success' || process.env.CLEAR_OUTCOME === 'failure') {
+              status = `⚠️ An earlier step failed before the artifact could be checked — see the run log.`;
+            } else if (process.env.SKIPPED === 'true') {
+              status = `⏳ Branch advanced mid-run — not yet checked against \`${headSha}\`. The run that pushed it will report.`;
+            } else if (process.env.DOWNLOAD_OUTCOME !== 'success') {
+              // Ambiguous by construction (see the download step's own
+              // comment): either the artifact never existed this run, or the
+              // download itself failed transiently. Say so rather than
+              // guessing either "regenerated" or "up-to-date".
+              status = `⚠️ Could not verify — the \`${process.env.ARTIFACT_NAME}\` artifact wasn't available this run.`;
+            } else if (process.env.COMMIT_OUTCOME !== 'success') {
+              // The download succeeded, so the commit step DID run (its own
+              // if: requires exactly that) — a non-success outcome here
+              // means it ran and failed (e.g. a rejected push from a race),
+              // not "nothing to commit". COMMITTED is unset either way, so
+              // without this check a real failure would misreport as the
+              // clean up-to-date case below.
+              status = `⚠️ The commit step failed after a successful download — check the run log.`;
+            } else if (process.env.COMMITTED === 'true') {
+              status = `🔄 Regenerated ${noun}s this run.`;
+            } else {
+              status = `✅ ${noun}s up-to-date — no changes from this push.`;
+            }
+            const body = `${marker}\n**Status:** ${status}\n\nHead: \`${headSha}\``;
+            const prNumber = Number(process.env.PR_NUMBER);
+            // The lookup can't fail open the way the update/create below
+            // can: its result picks update-vs-create, so an error swallowed
+            // into "not found" doesn't lose the comment, it posts a
+            // *duplicate*, and every later run duplicates again. `paginate`
+            // for the same reason — past 100 comments the marker falls off
+            // page one and reads as a genuine no-match.
+            let comments;
+            try {
+              comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              });
+            } catch (e) {
+              core.warning(`Could not list PR comments (${e.message}); skipping the freshness comment rather than risking a duplicate.`);
+              return;
+            }
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            try {
+              if (existing) {
+                await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ ...context.repo, issue_number: prNumber, body });
+              }
+            } catch (e) {
+              core.warning(`Could not post the freshness comment (${e.message}); the artifact is committed to the branch regardless.`);
+            }
