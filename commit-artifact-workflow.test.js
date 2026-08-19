@@ -124,6 +124,48 @@ test("fails fast, before checkout, when comment-marker or dispatch-workflow is s
   assert.match(validate.run, /exit 1/);
 });
 
+test("fails fast on an empty branch-ref, before checkout can silently fall back", () => {
+  // Real Codex finding: actions/checkout treats an empty `ref:` as unset
+  // and silently falls back to the triggering event's own ref (typically
+  // the synthetic merge commit on a pull_request run) instead of failing.
+  // The checkout would then succeed against the WRONG commit, and the
+  // guard step's mismatch against expected-head-sha would read as the same
+  // ordinary "branch-ref advanced" race this workflow already handles —
+  // leaving the run green with committed: false instead of surfacing the
+  // caller's empty context expression. Same underlying shape as the
+  // expected-head-sha check below: required: true only checks the caller
+  // supplied the KEY, not that its value is non-empty.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.equal(validate.env.BRANCH_REF, "${{ inputs.branch-ref }}");
+  assert.match(validate.run, /\[ -z "\$BRANCH_REF" \]/);
+
+  // Real execution, not just a structural regex: an empty BRANCH_REF must
+  // exit nonzero, and a real one must not trip this check.
+  const runCase = (branchRef) => {
+    try {
+      execFileSync("bash", ["-c", validate.run], {
+        env: {
+          ...process.env,
+          BRANCH_REF: branchRef,
+          EXPECTED_HEAD_SHA: "a".repeat(40),
+          PR_NUMBER: "",
+          COMMENT_MARKER: "",
+          DISPATCH_WORKFLOW: "",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { code: 0 };
+    } catch (e) {
+      return { code: e.status, output: String(e.stdout) + String(e.stderr) };
+    }
+  };
+  const empty = runCase("");
+  assert.equal(empty.code, 1, "an empty branch-ref must be rejected");
+  assert.match(empty.output, /branch-ref is ''/);
+  assert.equal(runCase("feature/some-branch").code, 0, "a real branch-ref must not be rejected");
+});
+
 test("fails fast on an expected-head-sha that isn't a real full commit SHA", () => {
   // A caller typically supplies github.event.pull_request.head.sha, which
   // is EMPTY on any event without a pull_request context (workflow_dispatch,
