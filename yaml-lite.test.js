@@ -376,6 +376,77 @@ test("does not false-positive on a validly-quoted scalar whose content happens t
   assert.equal(doc.a, 'a"');
 });
 
+test("accepts an empty flow mapping as a value, and throws on a non-empty one", () => {
+  // "permissions: {}" is a common least-privilege idiom and unambiguous, so
+  // it's supported directly. A non-empty flow mapping ("{ contents: read }")
+  // is real, valid YAML — verified against yaml.safe_load, which parses it
+  // into a genuine nested dict — but is out of this minimal parser's scope.
+  // Before this fix, parseScalar had no check for either shape, so a
+  // non-empty flow mapping fell through to the plain-scalar fallback and
+  // was silently returned as the literal brace text (a string), not
+  // rejected.
+  const doc = parseWorkflowYaml("permissions: {}\n");
+  assert.deepEqual(doc.permissions, {});
+
+  assert.throws(
+    () => parseWorkflowYaml("permissions: {contents: read}\n"),
+    /flow mappings are not supported/,
+  );
+});
+
+test("throws on a non-empty flow mapping reached as a sequence item too, not just as a bare value", () => {
+  // parseSequence's "- key: value" detection only recognizes a bare
+  // identifier/quoted-string key before the colon; "- { a: 1 }" doesn't
+  // match, so it falls through to parseScalar on "{ a: 1 }" — the same
+  // function the bare-value case above exercises, but reached via a
+  // different call site, so it needs its own coverage.
+  assert.throws(
+    () => parseWorkflowYaml("foo:\n  - { a: 1 }\n"),
+    /flow mappings are not supported/,
+  );
+});
+
+test("throws on a duplicate mapping key at the top level", () => {
+  // Verified against yaml.safe_load("a: 1\na: 2\n"): PyYAML's default
+  // SafeLoader is lenient and silently keeps the last value ({'a': 2}), but
+  // duplicate-key rejection is the spec-correct, commonly-enforced reading
+  // (confirmed with a stricter loader using a no-duplicates constructor,
+  // which raises ConstructorError). Before this fix, parseMapping's
+  // `obj[key] = ...` assignment was unconditional, so a repeated
+  // "permissions:" block — a plausible copy-paste mistake — silently kept
+  // only the last one with no signal that the first was ever discarded.
+  assert.throws(
+    () => parseWorkflowYaml("permissions:\n  contents: read\npermissions:\n  contents: write\n"),
+    /duplicate mapping key "permissions"/,
+  );
+});
+
+test("throws on a duplicate mapping key nested under another key", () => {
+  assert.throws(
+    () => parseWorkflowYaml("permissions:\n  contents: read\n  contents: write\n"),
+    /duplicate mapping key "contents"/,
+  );
+});
+
+test("throws on a duplicate mapping key inside an inline '- key: value' sequence item", () => {
+  // Inline mapping items (a sequence item written as "- key: value" with
+  // further "key: value" siblings at the same indent) are built by
+  // applyMappingEntry via a separate `target[key] = ...` assignment site
+  // from parseMapping's `obj[key] = ...` — both needed the same guard.
+  assert.throws(
+    () => parseWorkflowYaml("foo:\n  - a: 1\n    a: 2\n"),
+    /duplicate mapping key "a"/,
+  );
+});
+
+test("does not false-positive on same-named keys at different nesting levels", () => {
+  // "contents" appears once under "permissions" and once under a sibling
+  // "other" key — these are different objects, not a duplicate.
+  const doc = parseWorkflowYaml("permissions:\n  contents: read\nother:\n  contents: write\n");
+  assert.equal(doc.permissions.contents, "read");
+  assert.equal(doc.other.contents, "write");
+});
+
 test("round-trips this repository's own commit-artifact.yml without throwing", () => {
   const yamlPath = path.join(
     __dirname,
