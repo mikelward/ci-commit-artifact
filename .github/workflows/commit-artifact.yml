@@ -97,6 +97,34 @@ on:
         required: false
         type: string
         default: 'file'
+    secrets:
+      push-token:
+        description: >-
+          A fine-grained PAT (Contents: read and write, scoped to this
+          repository only) used to push the commit instead of the job's own
+          GITHUB_TOKEN. A GITHUB_TOKEN-authored push starts no workflow run
+          on its own, which is why dispatch-workflow exists — but dispatching
+          onto branch-ref is safe ONLY when the CALLING workflow's own
+          trigger (github.event_name, read directly below rather than taken
+          as a caller-supplied input — a caller declaring the wrong one
+          would silently defeat this whole check) is 'pull_request': there,
+          the workflow file that actually runs is already the PR branch's
+          own copy, so a dispatch onto that same branch grants it no new
+          trust. It is NOT safe when the caller's trigger is
+          'pull_request_target': that trigger always reads the workflow
+          DEFINITION from the repository's default branch regardless of
+          which ref runs, so a workflow_dispatch onto the PR's own branch
+          would instead execute THAT branch's — potentially PR-controlled —
+          copy of the workflow, with whatever elevated permissions the
+          calling workflow's own actions:write grant holds. This secret is
+          how pull_request_target callers get a safe retrigger instead: an
+          authenticated PAT push looks like an ordinary push and retriggers
+          the caller's own pull_request_target trigger directly, no dispatch
+          needed. Required when the caller is pull_request_target-triggered
+          and dispatch-workflow is set; the validation step below refuses
+          that combination without it rather than silently falling back to
+          an unsafe dispatch.
+        required: false
     outputs:
       committed:
         description: >-
@@ -129,6 +157,7 @@ jobs:
       commit_sha: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
     steps:
       - name: Validate the input combination
+        id: validate
         # Fails fast, before checkout or any real work. Runs unconditionally
         # — unlike the pr-number checks below (only relevant when a caller
         # sets one of the optional inputs that needs it), expected-head-sha
@@ -182,8 +211,26 @@ jobs:
           PR_NUMBER: ${{ inputs.pr-number }}
           COMMENT_MARKER: ${{ inputs.comment-marker }}
           DISPATCH_WORKFLOW: ${{ inputs.dispatch-workflow }}
+          # Read directly from the run's own github context, NOT taken as a
+          # caller-supplied input (Codex review, PR #1): a reusable workflow
+          # shares the calling workflow's github context for the whole run
+          # (the same fact that lets download-artifact below see an
+          # artifact a job in the CALLER uploaded), so this is ground truth
+          # about what actually triggered the run, not a claim a caller
+          # could get wrong -- honestly or otherwise -- the way a
+          # caller-declared string input could. A wrong caller-declared
+          # value would have silently defeated the whole check just below.
+          EVENT_NAME: ${{ github.event_name }}
+          # Not itself spliced anywhere below or logged — only ever tested
+          # for emptiness, via a bare shell string comparison rather than a
+          # command whose argv or output could land in the run log.
+          HAS_PUSH_TOKEN: ${{ secrets.push-token != '' }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request_target" ] && [ -n "$DISPATCH_WORKFLOW" ] && [ "$HAS_PUSH_TOKEN" != "true" ]; then
+            echo "::error::this run was triggered by pull_request_target and dispatch-workflow is set, but no push-token secret was given. Dispatching onto branch-ref under pull_request_target would run that branch's own (potentially PR-controlled) copy of the workflow file with dispatch-workflow's elevated permissions -- pass a push-token secret (see its description) instead of relying on dispatch-workflow here."
+            exit 1
+          fi
           # actions/download-artifact reads `!!inputs.name` to decide whether
           # this is a single-artifact download — an empty string is exactly
           # as falsy as an omitted input, so it falls into the "download
@@ -210,6 +257,11 @@ jobs:
             echo "::error::pr-number must be a positive integer, got '$PR_NUMBER'"
             exit 1
           fi
+          # Written last, only once every check above has passed -- an
+          # earlier write would need $GITHUB_OUTPUT bound in every test
+          # (and every real run) that exercises any check below this line,
+          # for a value that a failing run never needed in the first place.
+          echo "use_push_token=$HAS_PUSH_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Check out the branch
         id: checkout
@@ -380,7 +432,16 @@ jobs:
         id: commit
         if: steps.guard.outputs.skip != 'true' && steps.download.outcome == 'success'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # push-token when the caller supplied one, so the push authenticates
+          # as a real user (retriggers pull_request/pull_request_target
+          # naturally) instead of GITHUB_TOKEN (retriggers nothing). validate
+          # already refused the one combination where falling back to
+          # GITHUB_TOKEN here would be unsafe (pull_request_target +
+          # dispatch-workflow + no push-token) — this fallback covers only
+          # the safe remaining cases: pull_request_target with no
+          # dispatch-workflow at all (caller retriggers some other way), or
+          # plain pull_request (dispatch-workflow, if set, is safe there).
+          GH_TOKEN: ${{ secrets.push-token || github.token }}
           # Same reasoning as the guard step: none of these are safe to
           # splice directly into the script.
           BRANCH_REF: ${{ inputs.branch-ref }}
@@ -519,7 +580,14 @@ jobs:
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch CI on the new commit
-        if: steps.commit.outputs.committed == 'true' && inputs.dispatch-workflow != ''
+        # Only when the push used GITHUB_TOKEN: a push-token push already
+        # authenticated as a real user, which retriggers the caller's own
+        # pull_request/pull_request_target trigger on its own -- dispatching
+        # again on top of that would start a second, redundant run of the
+        # same workflow for the same commit.
+        if: >-
+          steps.commit.outputs.committed == 'true' && inputs.dispatch-workflow != ''
+          && steps.validate.outputs.use_push_token != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH_REF: ${{ inputs.branch-ref }}
@@ -531,6 +599,12 @@ jobs:
             echo "::error::Pushed to $BRANCH_REF but could not dispatch $DISPATCH_WORKFLOW on it (does it have workflow_dispatch with a pr input, on the default branch?). Dispatch it by hand from the Actions tab."
             exit 1
           fi
+
+      - name: Note that push-token already retriggered CI
+        if: >-
+          steps.commit.outputs.committed == 'true' && inputs.dispatch-workflow != ''
+          && steps.validate.outputs.use_push_token == 'true'
+        run: echo "::notice::push-token was supplied; skipping dispatch-workflow since the authenticated push already retriggers CI on its own."
 
       - name: Comment freshness on the PR
         if: always() && inputs.comment-marker != '' && inputs.pr-number != ''
