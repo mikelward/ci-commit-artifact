@@ -79,7 +79,7 @@ test("declares push-token as an optional secret", () => {
   assert.equal(secrets["push-token"].required, false);
 });
 
-test("refuses pull_request_target + dispatch-workflow without push-token", () => {
+test("refuses dispatch-workflow without push-token for any trigger other than pull_request", () => {
   // The caller's trigger is read from github.event_name directly (Codex
   // review, PR #1) -- not a caller-supplied input, which a caller could get
   // wrong and silently defeat this whole check. The test harness plays the
@@ -87,10 +87,17 @@ test("refuses pull_request_target + dispatch-workflow without push-token", () =>
   // (that's not a real env var), so it sets EVENT_NAME directly, which is
   // exactly what ${{ github.event_name }} would have been mapped to by the
   // runner in a real run.
+  //
+  // Allowlist, not a denylist of one named trigger (Codex review, this PR):
+  // an earlier version only excluded EVENT_NAME == "pull_request_target" by
+  // name, so any OTHER non-pull_request trigger (workflow_run, schedule,
+  // issue_comment, ...) sailed through the same unsafe dispatch path
+  // unchecked, even though the push-token secret's own description already
+  // documents dispatch-without-a-token as safe ONLY for pull_request.
   const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
   const validate = steps[validateIdx];
   assert.equal(validate.env.EVENT_NAME, "${{ github.event_name }}");
-  assert.match(validate.run, /EVENT_NAME" = "pull_request_target"/);
+  assert.match(validate.run, /EVENT_NAME" != "pull_request"/);
 
   const runCase = (eventName, dispatchWorkflow, hasPushToken) => {
     try {
@@ -118,10 +125,15 @@ test("refuses pull_request_target + dispatch-workflow without push-token", () =>
     }
   };
 
-  // The one unsafe combination: pull_request_target, dispatching, no token.
-  const unsafe = runCase("pull_request_target", "ci.yml", "false");
-  assert.equal(unsafe.code, 1, "pull_request_target + dispatch-workflow + no push-token must be refused");
-  assert.match(unsafe.output, /no push-token secret was given/);
+  // Every non-pull_request trigger, dispatching, with no token: unsafe.
+  // pull_request_target is the originally-caught case; workflow_run and
+  // schedule are two more that read the workflow definition from the
+  // default branch the same way and were NOT caught by the old denylist.
+  for (const eventName of ["pull_request_target", "workflow_run", "schedule"]) {
+    const unsafe = runCase(eventName, "ci.yml", "false");
+    assert.equal(unsafe.code, 1, `${eventName} + dispatch-workflow + no push-token must be refused`);
+    assert.match(unsafe.output, /no push-token secret was given/);
+  }
 
   // Every other combination is fine.
   assert.equal(
@@ -130,24 +142,23 @@ test("refuses pull_request_target + dispatch-workflow without push-token", () =>
     "pull_request_target + dispatch-workflow + push-token is safe (the push retriggers directly)",
   );
   assert.equal(
-    runCase("pull_request_target", "", "false").code,
+    runCase("workflow_run", "", "false").code,
     0,
-    "pull_request_target with no dispatch-workflow at all has nothing unsafe to refuse",
+    "workflow_run with no dispatch-workflow at all has nothing unsafe to refuse",
   );
   assert.equal(
     runCase("pull_request", "ci.yml", "false").code,
     0,
-    "plain pull_request + dispatch-workflow + no push-token is the originally-safe case",
+    "plain pull_request + dispatch-workflow + no push-token is the only trigger this fallback is safe for",
   );
 });
 
-test("a caller triggered by something other than pull_request_target is never refused on that basis alone", () => {
-  // Only one combination is unsafe (pull_request_target + dispatch-workflow
-  // + no push-token, covered above) -- github.event_name is ground truth
-  // about the run, not a caller's claim to validate against an enum, so a
-  // trigger this workflow has no opinion about (push, schedule, whatever
-  // future caller shape) must pass through untouched rather than being
-  // rejected for not matching a fixed list.
+test("a caller with no dispatch-workflow set is never refused on trigger alone, whatever the trigger", () => {
+  // The trigger check only fires when dispatch-workflow is actually set --
+  // github.event_name is ground truth about the run, not a caller's claim
+  // to validate against an enum, so a trigger this workflow has no other
+  // opinion about (push, a future caller shape) must pass through
+  // untouched when there's no dispatch to make unsafe.
   const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
   const validate = steps[validateIdx];
   execFileSync("bash", ["-c", validate.run], {
