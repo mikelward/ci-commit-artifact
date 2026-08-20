@@ -1,6 +1,6 @@
-// Tests for yaml-lite.js — the same reason vitest-shim.mjs gets its own
-// tests in mikelward/npm-update: anything test tooling depends on needs its
-// own coverage, or a bug in the tool masks bugs in what it checks.
+// Tests for yaml-lite.js — the parser this repo exists to maintain. Anything
+// a consumer's test tooling depends on needs its own coverage here, or a bug
+// in the tool masks bugs in what it checks downstream.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -98,10 +98,10 @@ test("parses a block sequence item that is itself a nested mapping block", () =>
 });
 
 test("strips an inline comment from a plain scalar, but not a # inside a quoted one", () => {
-  // Caught by Codex against this repo's own commit-artifact.yml, which uses
-  // exactly this shape (`contents: write # push the commit`): without this,
-  // the value parses as "write # push the commit" instead of "write",
-  // silently disagreeing with what GitHub's own YAML parser reads.
+  // Caught by Codex against a real workflow using exactly this shape
+  // (`contents: write # push the commit`): without this, the value parses
+  // as "write # push the commit" instead of "write", silently disagreeing
+  // with what GitHub's own YAML parser reads.
   const doc = parseWorkflowYaml(
     "a: write # push the commit\nb: 'it''s # not a comment'\nc: \"a # b\"\nd: value#no-space-before-hash-is-not-a-comment\n",
   );
@@ -559,6 +559,62 @@ test("a tab at a block scalar's dedent boundary still rejects, even with content
   );
 });
 
+test("throws on a tab in a blank or comment-only line outside any block scalar", () => {
+  // Neither line holds a mapping key, a sequence item, or block-scalar
+  // payload — a blank line and a full-line comment are both excluded from
+  // structural parsing entirely, so nothing had ever visited them to check.
+  // Verified against yaml.safe_load("a: 1\n\t# comment\nb: 2\n") and
+  // ("a: 1\n\t\nb: 2\n"), both a ScannerError despite the tab-bearing line
+  // holding no content of its own.
+  assert.throws(
+    () => parseWorkflowYaml("a: 1\n\t# comment\nb: 2\n"),
+    /tab in indentation/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: 1\n\t\nb: 2\n"),
+    /tab in indentation/,
+  );
+});
+
+test("throws on a tab-only blank line inside a block scalar, before or after its margin is established", () => {
+  // A line that is nothing but tabs still trims to "" (this file's own
+  // isBlank definition), which previously exempted it from the
+  // block-scalar tab check entirely. Verified against
+  // yaml.safe_load("run: |\n\t\n  x\n") (the tab-only line comes BEFORE
+  // anything establishes the block's margin) and
+  // ("run: |\n  x\n\t\t\n  y\n") (it comes AFTER, within the established
+  // margin) — both a ScannerError.
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n\t\n  x\n"),
+    /tab in indentation/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n  x\n\t\t\n  y\n"),
+    /tab in indentation/,
+  );
+});
+
+test("does not treat U+00A0 (NBSP) as YAML separation whitespace", () => {
+  // JS's \s matches Unicode whitespace generally, including NBSP, but
+  // YAML's own s-white is ASCII space and tab only. Three checks in this
+  // file narrow \s to [ \t] for exactly this reason — verified against
+  // yaml.safe_load for each:
+  // - A colon followed by NBSP inside a plain scalar's VALUE is ordinary
+  //   content, not a nested mapping-value indicator ("name: Build:\xa0Linux"
+  //   -> {'name': 'Build:\xa0Linux'}), so parseScalar's colon check must not
+  //   reject it.
+  const doc = parseWorkflowYaml("name: Build: Linux\n");
+  assert.equal(doc.name, "Build: Linux");
+  // - NBSP does not start a comment ("a: b\xa0# not a comment" ->
+  //   {'a': 'b\xa0# not a comment'}), unlike a real space before #.
+  const doc2 = parseWorkflowYaml("a: b # not a comment\n");
+  assert.equal(doc2.a, "b # not a comment");
+  // A real space DOES still start a comment — the fix must not disable
+  // comment detection generally, only for the non-s-white NBSP case.
+  const doc3 = parseWorkflowYaml("a: b # a real comment\n");
+  assert.equal(doc3.a, "b");
+});
+
 test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
   // `name: "example` (no closing quote) previously fell through every
   // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since
@@ -614,36 +670,6 @@ test("throws yaml-lite's own error on an invalid escape sequence inside a double
   );
   // A scalar using only real escapes must still parse.
   assert.equal(parseWorkflowYaml('a: "a\\tb"\n').a, "a\tb");
-});
-
-test("throws a clearly-scoped error on an implicit multi-line plain scalar block value, not a confusing generic one", () => {
-  // "a:\n  free text\n  more text\n" is real, valid YAML — verified against
-  // yaml.safe_load, which folds it to {'a': 'free text more text'}, using a
-  // DIFFERENT folding rule than this file's own ">" support (a more-
-  // indented line inside this construct folds to a plain space, unlike a
-  // ">"-folded scalar's "more-indented lines break the fold" behavior —
-  // yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
-  // {'a': 'line one indented line two'}, not the ">"-style hard break).
-  // Reusing the ">" folding logic here would be quietly wrong, not merely
-  // unimplemented, so this is out of this parser's scope rather than a
-  // guess at a construct with its own subtle rules. Before this check
-  // existed, the same input still failed — just via splitKeyValue's
-  // generic "could not parse mapping entry: ..." error, found by fuzzing.
-  assert.throws(
-    () => parseWorkflowYaml("a:\n  free text\n  more text\n"),
-    /implicit multi-line plain scalar/,
-  );
-  // A single-line implicit scalar hits the exact same construct (its
-  // "block" is just one line) and is equally out of scope.
-  assert.throws(
-    () => parseWorkflowYaml("a:\n  free text\n"),
-    /implicit multi-line plain scalar/,
-  );
-  // Contrast: a deeper block whose first line genuinely looks like a
-  // mapping key ("key: value" or bare "key:") is unaffected — that's the
-  // ordinary nested-mapping case this parser has always supported.
-  const doc = parseWorkflowYaml("a:\n  b: 1\n");
-  assert.equal(doc.a.b, 1);
 });
 
 test("accepts an empty flow mapping as a value, and throws on a non-empty one", () => {
@@ -760,6 +786,36 @@ test("still catches a duplicate __proto__ key, the same as any other key", () =>
     () => parseWorkflowYaml("a:\n  __proto__: 1\n  __proto__: 2\n"),
     /duplicate mapping key "__proto__"/,
   );
+});
+
+test("throws a clearly-scoped error on an implicit multi-line plain scalar block value, not a confusing generic one", () => {
+  // "a:\n  free text\n  more text\n" is real, valid YAML — verified against
+  // yaml.safe_load, which folds it to {'a': 'free text more text'}, using a
+  // DIFFERENT folding rule than this file's own ">" support (a more-
+  // indented line inside this construct folds to a plain space, unlike a
+  // ">"-folded scalar's "more-indented lines break the fold" behavior —
+  // yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
+  // {'a': 'line one indented line two'}, not the ">"-style hard break).
+  // Reusing the ">" folding logic here would be quietly wrong, not merely
+  // unimplemented, so this is out of this parser's scope rather than a
+  // guess at a construct with its own subtle rules. Before this check
+  // existed, the same input still failed — just via splitKeyValue's
+  // generic "could not parse mapping entry: ..." error, found by fuzzing.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n  more text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // A single-line implicit scalar hits the exact same construct (its
+  // "block" is just one line) and is equally out of scope.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // Contrast: a deeper block whose first line genuinely looks like a
+  // mapping key ("key: value" or bare "key:") is unaffected — that's the
+  // ordinary nested-mapping case this parser has always supported.
+  const doc = parseWorkflowYaml("a:\n  b: 1\n");
+  assert.equal(doc.a.b, 1);
 });
 
 test("round-trips this repository's own commit-artifact.yml without throwing", () => {

@@ -7,12 +7,12 @@
 // something wrong.
 //
 // Vendored from mikelward/yaml-lite (canonical source; last synced from
-// mikelward/yaml-lite#1, its tab-in-indentation scoping fix). This parser
-// originated in THIS repository, was copied
-// "verbatim" into mikelward/npm-update, and the two copies then drifted
-// independently for a while before being reconciled into mikelward/yaml-lite,
-// which is now the source of truth — fix a bug there first, then re-sync
-// this copy (see AGENTS.md).
+// mikelward/yaml-lite#1, its indentation-tab and NBSP-whitespace fixes).
+// This parser originated in THIS repository, was copied "verbatim" into
+// mikelward/npm-update, and the two copies then drifted independently for a
+// while before being reconciled into mikelward/yaml-lite, which is now the
+// source of truth — fix a bug there first, then re-sync this copy (see
+// AGENTS.md).
 //
 // Exists so this repository's tests can assert real structure instead of
 // regex/string-matching over serialized YAML text. That fragility is exactly
@@ -61,9 +61,10 @@ function parseWorkflowYaml(text) {
     // as spaces for LENGTH purposes here, since `indent` is used for plain
     // depth comparisons (dedent detection, block-scalar margins) throughout
     // the parser. Whether a tab is actually ALLOWED there is a separate
-    // question, checked later — see checkNoIndentTab and parseBlockScalar's
-    // own scoped check — once it's known whether this position is genuinely
-    // structural or opaque block-scalar payload. Checking it HERE, globally,
+    // question, checked later — see parseBlockScalar's own scoped check and
+    // validateRemainingIndentTabs at the end of this function — once it's
+    // known whether this position is genuinely structural or opaque
+    // block-scalar payload. Checking it HERE, globally,
     // for every raw line before any of that context exists, was this file's
     // first version of the check and it was wrong: a tab used as literal
     // script content deep inside a `run: |` block (past the block's own
@@ -85,21 +86,24 @@ function parseWorkflowYaml(text) {
     };
   });
 
-  // Throws unless `line`'s leading indent is tab-free, up to (and only up
-  // to) its own `indent` — the portion actually being trusted as structure
-  // at the call site. Called wherever a line is consumed AS a mapping key
-  // or sequence item (never at raw-line construction, and never inside
-  // parseBlockScalar's own content region — see its own scoped check for
-  // why the boundary there is `effectiveIndent`, not the line's full
-  // `indent`). Verified against yaml.safe_load("a:\n\tb: c\n") and
-  // ("a:\n  \tb: c\n"), both a ScannerError ("found character '\t' that
-  // cannot start any token") for a tab anywhere in a real mapping key's
-  // indentation, tab-first or after leading spaces alike.
-  function checkNoIndentTab(line) {
-    if (line.raw.slice(0, line.indent).includes("\t")) {
-      throw new Error(`yaml-lite: tab in indentation at line ${line.n} — not supported`);
-    }
-  }
+  // Raw indices actually consumed by SOME parseBlockScalar call, whether
+  // that line held content, established the block's margin, or was merely
+  // blank — populated as parseBlockScalar's own loop runs. A line in this
+  // set was already tab-checked there, scoped to that block's own
+  // effectiveIndent; a line NOT in this set is checked in full below,
+  // once parsing completes (validateRemainingIndentTabs). Two rounds of
+  // review found the same class of gap here: first a whole-line check ran
+  // globally before any block-scalar context existed (rejecting genuine
+  // payload tabs past a block's margin); then, once scoped, a line outside
+  // every block scalar — a blank line or a full-line comment, both excluded
+  // from `structural` — was never visited by anything at all (accepting a
+  // tab real YAML rejects), and separately a blank line WITHIN a block
+  // scalar was skipped by an `!line.isBlank` guard before establishing or
+  // continuing the block's own margin (same silent-accept bug, narrower).
+  // One mechanism now covers both: parseBlockScalar tab-checks and marks
+  // every line it consumes, blank or not; everything else gets a plain,
+  // whole-line check once, at the end.
+  const blockScalarConsumed = new Set();
 
   // The structural view: every raw line that isn't blank or a full-line
   // comment, each still carrying its own index into rawLines so block-scalar
@@ -158,8 +162,15 @@ function parseWorkflowYaml(text) {
         sawNonSpace = true;
         continue;
       }
-      if (!/\s/.test(ch)) sawNonSpace = true;
-      if (ch === "#" && (i === 0 || /\s/.test(text[i - 1]))) {
+      // [ \t], not JS's \s: YAML's own separation-whitespace (s-white) is
+      // ASCII space and tab only, but \s also matches Unicode whitespace
+      // like U+00A0 (NBSP) — found by Codex review: "b # not a
+      // comment" is ordinary plain-scalar content in real YAML (verified
+      // against yaml.safe_load), not a comment start, because NBSP isn't
+      // s-white. Using \s here treated it as one, silently truncating the
+      // scalar and dropping everything from the (non-)comment onward.
+      if (!/[ \t]/.test(ch)) sawNonSpace = true;
+      if (ch === "#" && (i === 0 || /[ \t]/.test(text[i - 1]))) {
         return text.slice(0, i);
       }
     }
@@ -310,8 +321,15 @@ function parseWorkflowYaml(text) {
     // and "a: b:\tc" both raise "mapping values are not allowed here";
     // "a: [b: c]" parses as [{'b': 'c'}], not a scalar. A colon NOT
     // followed by whitespace ("http://x.com", "1:30", "b:c") is
-    // unambiguous and stays a plain scalar.
-    if (/:\s|:$/.test(s)) {
+    // unambiguous and stays a plain scalar. [ \t], not \s: YAML's own
+    // separation-whitespace is ASCII space and tab only, and \s also
+    // matches Unicode whitespace like U+00A0 (NBSP) — found by Codex
+    // review: "Build: Linux" is one ordinary plain scalar in real
+    // YAML (verified against yaml.safe_load), because the colon there
+    // isn't followed by s-white at all, just an NBSP that happens to look
+    // like a space. \s treated it as a real separator and rejected valid
+    // content outright.
+    if (/:[ \t]|:$/.test(s)) {
       throw new Error(`yaml-lite: unquoted ": " or trailing ":" in a plain scalar (got ${JSON.stringify(s)})`);
     }
     return s;
@@ -401,7 +419,11 @@ function parseWorkflowYaml(text) {
         elementStart = true;
         continue;
       }
-      if (!/\s/.test(ch)) elementStart = false;
+      // [ \t], not \s — see the sibling note in parseScalar's colon check
+      // for why: \s also matches Unicode whitespace (NBSP, e.g.), which
+      // isn't genuine YAML flow-context whitespace and shouldn't count as
+      // "still at an element's start".
+      if (!/[ \t]/.test(ch)) elementStart = false;
     }
     // A quote still open at the string's end ('a: ["b, c]') is a
     // different, more specific defect — an unterminated quoted scalar —
@@ -520,10 +542,16 @@ function parseWorkflowYaml(text) {
       // dedents out of it, i.e. genuine indentation. Past that point is
       // opaque scalar content, where a tab is an ordinary payload byte, not
       // indentation — the distinction the earlier, whole-line version of
-      // this check (see rawLines' own comment) got wrong.
-      if (!line.isBlank && line.raw.slice(0, effectiveIndent).includes("\t")) {
+      // this check (see rawLines' own comment) got wrong. Checked even when
+      // `line.isBlank` — a line that is nothing but tabs still has
+      // indentation to validate up to effectiveIndent; verified against
+      // yaml.safe_load("run: |\n\t\n  x\n") and ("run: |\n  x\n\t\t\n  y\n"),
+      // both a ScannerError, whether the tab-only line comes before the
+      // block's margin is established or after.
+      if (line.raw.slice(0, effectiveIndent).includes("\t")) {
         throw new Error(`yaml-lite: tab in indentation at line ${line.n} — not supported`);
       }
+      blockScalarConsumed.add(i);
       collected.push(line.raw.length >= effectiveIndent ? line.raw.slice(effectiveIndent) : "");
       i++;
     }
@@ -629,6 +657,24 @@ function parseWorkflowYaml(text) {
   // to consuming the line — real YAML decides block-scalar-vs-mapping by
   // looking at exactly this shape on the first line of a deeper-indented
   // block, so this mirrors that rule rather than reinventing one.
+  //
+  // Deliberately still \s here, unlike the narrower [ \t] fixes elsewhere in
+  // this file (parseScalar's colon check, stripInlineComment, and
+  // hasBalancedFlowBrackets) — those each fix a single character
+  // classification without changing what gets PARSED as. This regex decides
+  // whether a whole line is treated as a mapping key at all; narrowing it
+  // would mean a key:value pair using \u00A0 (NBSP) as its separator
+  // ("a:\xa0b") stops being read as a mapping and becomes one long plain
+  // scalar instead (verified against yaml.safe_load, which really does
+  // treat it that way) — a document-shape change, not a leaf-level
+  // correction, and one this file has not verified every consequence of.
+  // Same reasoning applies to splitKeyValue's own copy of this pattern
+  // below, and to splitFlowSequence's `current.trim() === ""` element-start
+  // check, which strips NBSP the same way \s would. Left as a known,
+  // considered boundary rather than chased under the same pressure that
+  // got block-scalar folding wrong twice before it was verified line by
+  // line — narrow the file's stated scope further only with the same
+  // rigor those fixes needed.
   const MAPPING_KEY_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:]+?):(?:\s.*)?$/;
 
   function parseNode(indent) {
@@ -674,7 +720,6 @@ function parseWorkflowYaml(text) {
     const result = [];
     while (peek() && peek().indent === indent && (peek().content.startsWith("- ") || peek().content === "-")) {
       const line = structural[pos];
-      checkNoIndentTab(line);
       const rest = line.content === "-" ? "" : line.content.slice(2);
       pos++;
       if (rest.trim() === "") {
@@ -746,7 +791,6 @@ function parseWorkflowYaml(text) {
     applyMappingEntry(obj, firstLineRest, siblingIndent, firstLineRawIndex);
     while (peek() && peek().indent === siblingIndent) {
       const line = structural[pos];
-      checkNoIndentTab(line);
       pos++;
       applyMappingEntry(obj, line.content, siblingIndent, line.rawIndex);
     }
@@ -785,7 +829,6 @@ function parseWorkflowYaml(text) {
     const obj = {};
     while (peek() && peek().indent === indent) {
       const line = structural[pos];
-      checkNoIndentTab(line);
       pos++;
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(line.content);
       checkDuplicateKey(obj, key, line.n);
@@ -801,13 +844,41 @@ function parseWorkflowYaml(text) {
     return obj;
   }
 
-  if (structural.length === 0) return {};
+  // Every raw line NOT consumed by some parseBlockScalar call is outside
+  // every block scalar — whether it's a genuine structural line (a mapping
+  // key or sequence item, already implicitly relied on by parseMapping/
+  // parseSequence/parseInlineMappingItem) or a blank/full-line-comment line
+  // that structural parsing never even looks at (both are excluded from
+  // `structural`, and nothing else visits them either). Outside a block
+  // scalar, indentation is ALWAYS structural, content or not — verified
+  // against yaml.safe_load("a: 1\n\t# comment\nb: 2\n") and
+  // ("a: 1\n\t\nb: 2\n"), both a ScannerError despite the tab-bearing line
+  // holding no content of its own. Run once, after parsing, rather than at
+  // each structural consumption site individually: the earlier version of
+  // this check (checkNoIndentTab, called from parseMapping/parseSequence/
+  // parseInlineMappingItem) covered exactly the reachable-as-a-key-or-item
+  // lines and missed the two blank/comment shapes above, since neither is
+  // ever consumed as one.
+  function validateRemainingIndentTabs() {
+    rawLines.forEach((line, idx) => {
+      if (blockScalarConsumed.has(idx)) return;
+      if (line.raw.slice(0, line.indent).includes("\t")) {
+        throw new Error(`yaml-lite: tab in indentation at line ${line.n} — not supported`);
+      }
+    });
+  }
+
+  if (structural.length === 0) {
+    validateRemainingIndentTabs();
+    return {};
+  }
   const doc = parseNode(structural[0].indent);
   if (pos < structural.length) {
     throw new Error(
       `yaml-lite: stopped parsing at line ${structural[pos].n} — unsupported construct or indentation this parser doesn't handle`,
     );
   }
+  validateRemainingIndentTabs();
   return doc;
 }
 

@@ -49,6 +49,11 @@ const FRAGMENTS = [
   "@", "`", "%", "#", " #", "on:", "run:", "true", "false", "null", "~",
   "yes", "no", "off", "key", "0", "-1", "1.5", "${{ github.sha }}",
   "steps.x.outputs.y", "__proto__", "constructor", "prototype",
+  // A U+00A0 (NBSP) character and a tab-only "blank" line — both found real gaps here:
+  // JS's \s matches NBSP but YAML's own separation-whitespace doesn't, and
+  // a tab-only line trims to "" (this file's own isBlank definition) but
+  // still has indentation to validate.
+  " ", "\t\n", "\t\t\n",
 ];
 
 function randomYamlish(rng, maxFragments) {
