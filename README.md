@@ -69,5 +69,37 @@ The `commit` job's own steps never execute anything from the pull request —
 no build tool, no test runner, no dependency install — so an ordinary
 checkout, commit, and push there is trustworthy by construction.
 
+## `pull_request_target` callers: pass `push-token`
+
+A GITHUB_TOKEN-authored push starts no workflow run on its own, so the
+example above relies on `dispatch-workflow` to retrigger CI. That is only
+safe for a caller triggered by plain `pull_request` — `pull_request_target`
+always reads the workflow *definition* from the repository's default
+branch regardless of which ref actually runs, so dispatching onto the PR's
+own branch there would instead execute that branch's own, potentially
+PR-controlled, copy of the workflow file.
+
+This workflow reads which event triggered the calling workflow itself
+(`github.event_name`, shared with the caller for the whole run) rather than
+taking a caller's word for it, so there's nothing to declare either way — a
+`pull_request_target` caller just passes a `push-token` secret, a
+fine-grained PAT (Contents: read and write, scoped to that repository
+only). An authenticated push looks like an ordinary push and retriggers the
+caller's own trigger directly, no dispatch involved (and
+`dispatch-workflow`, if still set, is silently skipped rather than firing a
+redundant second run). The name doesn't matter to this workflow —
+`secrets.push-token` is just an input — but consumers across this fleet
+name the repository secret `CI_COMMIT_ARTIFACT_TOKEN`, so the same PAT can
+back any future caller that needs this same commit-back mechanism for a
+different kind of artifact:
+
+```yaml
+    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main
+    with:
+      # ... same as above
+    secrets:
+      push-token: ${{ secrets.CI_COMMIT_ARTIFACT_TOKEN }}
+```
+
 See `.github/workflows/commit-artifact.yml` for the full input/output
 reference, and `AGENTS.md` for the reasoning behind each guard.

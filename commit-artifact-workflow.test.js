@@ -72,6 +72,103 @@ test("declares every required input, and every optional one with a default", () 
   }
 });
 
+test("declares push-token as an optional secret", () => {
+  const secrets = doc.on.workflow_call.secrets;
+  assert.ok(secrets, "no secrets: block declared");
+  assert.ok(secrets["push-token"], "missing secret: push-token");
+  assert.equal(secrets["push-token"].required, false);
+});
+
+test("refuses pull_request_target + dispatch-workflow without push-token", () => {
+  // The caller's trigger is read from github.event_name directly (Codex
+  // review, PR #1) -- not a caller-supplied input, which a caller could get
+  // wrong and silently defeat this whole check. The test harness plays the
+  // role of the Actions runner here: it can't set github.event_name itself
+  // (that's not a real env var), so it sets EVENT_NAME directly, which is
+  // exactly what ${{ github.event_name }} would have been mapped to by the
+  // runner in a real run.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.equal(validate.env.EVENT_NAME, "${{ github.event_name }}");
+  assert.match(validate.run, /EVENT_NAME" = "pull_request_target"/);
+
+  const runCase = (eventName, dispatchWorkflow, hasPushToken) => {
+    try {
+      execFileSync("bash", ["-c", validate.run], {
+        env: {
+          ...process.env,
+          ARTIFACT_NAME: "ui-snapshots",
+          BRANCH_REF: "feature/some-branch",
+          EXPECTED_HEAD_SHA: "a".repeat(40),
+          PR_NUMBER: dispatchWorkflow ? "1" : "",
+          COMMENT_MARKER: "",
+          DISPATCH_WORKFLOW: dispatchWorkflow,
+          EVENT_NAME: eventName,
+          HAS_PUSH_TOKEN: hasPushToken,
+          // A real, writable sink: the script's last line on any passing
+          // path writes here, and every case in this test that expects
+          // code 0 has to actually reach it.
+          GITHUB_OUTPUT: "/dev/null",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { code: 0 };
+    } catch (e) {
+      return { code: e.status, output: String(e.stdout) + String(e.stderr) };
+    }
+  };
+
+  // The one unsafe combination: pull_request_target, dispatching, no token.
+  const unsafe = runCase("pull_request_target", "ci.yml", "false");
+  assert.equal(unsafe.code, 1, "pull_request_target + dispatch-workflow + no push-token must be refused");
+  assert.match(unsafe.output, /no push-token secret was given/);
+
+  // Every other combination is fine.
+  assert.equal(
+    runCase("pull_request_target", "ci.yml", "true").code,
+    0,
+    "pull_request_target + dispatch-workflow + push-token is safe (the push retriggers directly)",
+  );
+  assert.equal(
+    runCase("pull_request_target", "", "false").code,
+    0,
+    "pull_request_target with no dispatch-workflow at all has nothing unsafe to refuse",
+  );
+  assert.equal(
+    runCase("pull_request", "ci.yml", "false").code,
+    0,
+    "plain pull_request + dispatch-workflow + no push-token is the originally-safe case",
+  );
+});
+
+test("a caller triggered by something other than pull_request_target is never refused on that basis alone", () => {
+  // Only one combination is unsafe (pull_request_target + dispatch-workflow
+  // + no push-token, covered above) -- github.event_name is ground truth
+  // about the run, not a caller's claim to validate against an enum, so a
+  // trigger this workflow has no opinion about (push, schedule, whatever
+  // future caller shape) must pass through untouched rather than being
+  // rejected for not matching a fixed list.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  execFileSync("bash", ["-c", validate.run], {
+    env: {
+      ...process.env,
+      ARTIFACT_NAME: "ui-snapshots",
+      BRANCH_REF: "feature/some-branch",
+      EXPECTED_HEAD_SHA: "a".repeat(40),
+      PR_NUMBER: "",
+      COMMENT_MARKER: "",
+      DISPATCH_WORKFLOW: "",
+      EVENT_NAME: "push",
+      HAS_PUSH_TOKEN: "false",
+      GITHUB_OUTPUT: "/dev/null",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  // execFileSync throws on a nonzero exit, so reaching here already proves
+  // success -- nothing further to assert.
+});
+
 test("branch-ref documents the same-repo-only constraint", () => {
   // This workflow always checks out and pushes to the CALLER's own
   // repository (github.repository) — a fork PR's branch either doesn't
@@ -153,6 +250,9 @@ test("fails fast on an empty branch-ref, before checkout can silently fall back"
           PR_NUMBER: "",
           COMMENT_MARKER: "",
           DISPATCH_WORKFLOW: "",
+          EVENT_NAME: "pull_request",
+          HAS_PUSH_TOKEN: "false",
+          GITHUB_OUTPUT: "/dev/null",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -191,6 +291,9 @@ test("fails fast on an empty artifact-name, before download-artifact can silentl
           PR_NUMBER: "",
           COMMENT_MARKER: "",
           DISPATCH_WORKFLOW: "",
+          EVENT_NAME: "pull_request",
+          HAS_PUSH_TOKEN: "false",
+          GITHUB_OUTPUT: "/dev/null",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -848,6 +951,22 @@ test("CI is dispatched only after a real commit, and only when the caller asked 
     step("Dispatch CI on the new commit").if,
     /steps\.commit\.outputs\.committed == 'true' && inputs\.dispatch-workflow != ''/,
   );
+});
+
+test("CI is not dispatched again when push-token already retriggered it", () => {
+  // A push-token push authenticates as a real user and retriggers the
+  // caller's own trigger on its own; dispatching on top of that would start
+  // a second, redundant run of the same workflow for the same commit.
+  assert.match(
+    step("Dispatch CI on the new commit").if,
+    /steps\.validate\.outputs\.use_push_token != 'true'/,
+  );
+  // The inverse step exists and fires in exactly the opposite condition, so
+  // one or the other always explains what happened to a caller reading the
+  // run log — never neither.
+  const notice = step("Note that push-token already retriggered CI");
+  assert.match(notice.if, /steps\.commit\.outputs\.committed == 'true' && inputs\.dispatch-workflow != ''/);
+  assert.match(notice.if, /steps\.validate\.outputs\.use_push_token == 'true'/);
 });
 
 test("the freshness comment never runs without both a marker and a PR number", () => {
