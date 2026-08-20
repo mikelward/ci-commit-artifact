@@ -6,14 +6,24 @@
 // a thing to guess at, so it throws rather than silently returning
 // something wrong.
 //
+// Vendored from mikelward/yaml-lite (canonical source; last synced from
+// commit bbc7cb2c960b065ac35e1ee507935a24b720dee8). This parser originated
+// in THIS repository, was copied "verbatim" into mikelward/npm-update, and
+// the two copies then drifted independently for a while before being
+// reconciled into mikelward/yaml-lite, which is now the source of truth —
+// fix a bug there first, then re-sync this copy (see AGENTS.md).
+//
 // Exists so this repository's tests can assert real structure instead of
-// regex/string-matching over serialized YAML text — see
-// commit-artifact-workflow.test.js for what that fragility looked like in
-// practice. Kept in-process and dependency-free on purpose: this repo's own
-// workflow is YAML + bash + JS end to end, so shelling out to python3 for a
-// real YAML parser (PyYAML, as mikelward/codex-review's check_consumer.py
-// does) would be a second runtime taken on for test-time convenience, not a
-// structural need the way it is there.
+// regex/string-matching over serialized YAML text. That fragility is exactly
+// what motivated this: a "no expression is spliced into any run: block"
+// sweep written as a block-boundary regex couldn't reliably tell a run:
+// script line from an env: declaration or a with: input, and needed several
+// rounds of exclusion patches to stop false-positiving on its own fixes.
+// Kept in-process and dependency-free on purpose, matching every consumer's
+// "no dependencies, no package.json, no lockfile" rule: shelling out to
+// python3 for a real YAML parser (PyYAML, as mikelward/codex-review's
+// check_consumer.py does) would be a second runtime taken on for test-time
+// convenience, not a structural need the way it is there.
 //
 // Deliberately does NOT implement YAML 1.1's `on`/`off`/`yes`/`no`-as-boolean
 // expansion (only `true`/`false`/`null`/`~` are recognized) — that quirk is
@@ -220,7 +230,24 @@ function parseWorkflowYaml(text) {
       return s.slice(1, -1).replace(/''/g, "'");
     }
     if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
-      return JSON.parse(s);
+      // A closed double-quoted scalar can still carry an escape sequence
+      // JSON doesn't accept — YAML's own escape set and JSON's overlap but
+      // aren't identical (JSON has no \e, \0, \x.., \N, \_, \L, \P, and
+      // rejects an unrecognized \<letter> the same way JSON does), and
+      // JSON.parse throws its own bare SyntaxError for those, uncaught,
+      // instead of this file's "yaml-lite: ..." convention every OTHER
+      // rejection here follows. Found by fuzzing: '"a\qb"' passes
+      // hasClosingQuote (it only tracks whether the quote closes, not
+      // whether each escape is valid) and then throws
+      // "Bad escaped character in JSON" straight out of this function.
+      // Not a silent-wrong-answer bug — it already refused to return
+      // something incorrect — but an inconsistent one a caller pattern-
+      // matching on this parser's own error convention would trip over.
+      try {
+        return JSON.parse(s);
+      } catch {
+        throw new Error(`yaml-lite: invalid escape sequence in a double-quoted scalar (got ${JSON.stringify(s)})`);
+      }
     }
     if (s.startsWith("[")) {
       // An unmatched opening bracket ("runs-on: [ubuntu-latest", no closing
@@ -568,6 +595,13 @@ function parseWorkflowYaml(text) {
     return stripped + (sourceEndsWithNewline ? "\n" : "");
   }
 
+  // Same key-detection pattern splitKeyValue itself matches against, kept
+  // separate so parseNode can ask "is this a mapping?" without committing
+  // to consuming the line — real YAML decides block-scalar-vs-mapping by
+  // looking at exactly this shape on the first line of a deeper-indented
+  // block, so this mirrors that rule rather than reinventing one.
+  const MAPPING_KEY_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:]+?):(?:\s.*)?$/;
+
   function parseNode(indent) {
     const line = peek();
     if (!line) return null;
@@ -575,6 +609,34 @@ function parseWorkflowYaml(text) {
 
     if (line.content.startsWith("- ") || line.content === "-") {
       return parseSequence(line.indent);
+    }
+    if (!MAPPING_KEY_RE.test(line.content)) {
+      // A deeper-indented block whose first line is neither a sequence
+      // item nor a "key:"/"key: value" mapping entry is an implicit,
+      // indicator-less multi-line plain scalar block value — real, valid
+      // YAML ("a:\n  free text\n  more text\n" -> {'a': 'free text more
+      // text'}), found by fuzzing. Verified against yaml.safe_load that its
+      // folding is NOT the same algorithm this file's own ">" handling
+      // implements: a more-indented line inside an explicit folded scalar
+      // breaks the fold (see parseBlockScalar's folded-style comments), but
+      // the SAME shape inside an implicit plain-scalar block folds to a
+      // plain space regardless of relative indentation
+      // (yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
+      // {'a': 'line one indented line two'}, not the ">"-style "line
+      // one\n  indented\nline two"). Reusing parseBlockScalar's folding
+      // logic here would therefore be quietly wrong, not merely
+      // unimplemented — exactly the failure mode this file's folded-scalar
+      // comments describe getting bitten by twice already for the explicit
+      // case. Rather than risk a third wrong implementation under the same
+      // pressure, this construct is out of scope (see the file header) and
+      // throws its own clearly-scoped error. This is a message
+      // improvement, not a new restriction: every input reaching this
+      // branch already failed before this check existed, via
+      // splitKeyValue's generic "could not parse mapping entry" — this
+      // only makes the failure legible instead of confusing.
+      throw new Error(
+        `yaml-lite: line ${line.n} looks like an implicit multi-line plain scalar block value, which this parser does not support — use an explicit | or > block scalar, or put the value on the key's own line (got ${JSON.stringify(line.content)})`,
+      );
     }
     return parseMapping(line.indent);
   }
@@ -588,13 +650,30 @@ function parseWorkflowYaml(text) {
       if (rest.trim() === "") {
         const next = peek();
         result.push(next && next.indent > indent ? parseNode(next.indent) : null);
-      } else if (/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_.\-]+):( |$)/.test(rest)) {
-        // "- key: value" — an inline mapping item. Its siblings (if any)
-        // are indented past the dash itself, i.e. past where `rest` starts.
-        const siblingIndent = indent + (line.content.length - rest.length);
-        result.push(parseInlineMappingItem(rest, siblingIndent, line.rawIndex));
       } else {
-        result.push(parseScalar(rest));
+        // "- " only ever strips exactly ONE separation space (the ": "
+        // between dash and content is fixed, but YAML allows more than one
+        // there — "-   run: echo hi" is valid, three spaces after the
+        // dash). Any leftover leading whitespace made the mapping regex
+        // below (anchored with ^, no leading-whitespace tolerance) fail to
+        // match a real "key: value" item, so it fell through to parseScalar
+        // and returned the whole thing as a plain string ("run: echo hi")
+        // instead of a mapping. Verified against yaml.safe_load, which
+        // parses it as {'run': 'echo hi'}. restTrimmed is used only to
+        // classify and to parse the mapping's first line; siblingIndent is
+        // computed from restTrimmed's own length (not rest's), so it still
+        // lands exactly where the key actually starts, however many
+        // separation spaces preceded it.
+        const restTrimmed = rest.replace(/^ +/, "");
+        if (/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_.\-]+):( |$)/.test(restTrimmed)) {
+          // "- key: value" — an inline mapping item. Its siblings (if any)
+          // are indented past the dash itself, i.e. past where the key
+          // actually starts.
+          const siblingIndent = indent + (line.content.length - restTrimmed.length);
+          result.push(parseInlineMappingItem(restTrimmed, siblingIndent, line.rawIndex));
+        } else {
+          result.push(parseScalar(rest));
+        }
       }
     }
     return result;

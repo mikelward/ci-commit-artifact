@@ -69,6 +69,26 @@ test("parses a block sequence of mappings (- key: value siblings)", () => {
   assert.equal(doc.steps[1].name, "two");
 });
 
+test("parses a '- key: value' sequence item with MORE than one separation space after the dash", () => {
+  // "- " only strips exactly one separation space when computing `rest`;
+  // real YAML allows more than one there ("-   run: echo hi" is valid,
+  // verified against yaml.safe_load -> {'run': 'echo hi'}). The leftover
+  // leading whitespace previously made the inline-mapping-detection regex
+  // (anchored with ^, no leading-whitespace tolerance) fail to match, so
+  // the item fell through to parseScalar and returned the whole line as a
+  // plain string ("run: echo hi") instead of a mapping — the exact false
+  // pass a structural "does this step have a run: property" sweep would
+  // miss entirely, since the parsed item has no run property to inspect.
+  const doc = parseWorkflowYaml("steps:\n  -   run: echo hi\n");
+  assert.deepEqual(doc.steps, [{ run: "echo hi" }]);
+  // A multi-key sibling after the extra dash spacing must still land at
+  // the CORRECT indent (computed from where the key actually starts, not
+  // from the old fixed "- " offset) — regression coverage for getting the
+  // indent math right, not just the classification.
+  const doc2 = parseWorkflowYaml("steps:\n  -   name: x\n      run: echo hi\n");
+  assert.deepEqual(doc2.steps, [{ name: "x", run: "echo hi" }]);
+});
+
 test("parses a block sequence item that is itself a nested mapping block", () => {
   const doc = parseWorkflowYaml(
     "steps:\n  -\n    name: one\n    with:\n      key: value\n",
@@ -544,6 +564,53 @@ test("does not false-positive on a validly-quoted scalar whose content happens t
   // is the character after it.
   const doc = parseWorkflowYaml('a: "a\\""\n');
   assert.equal(doc.a, 'a"');
+});
+
+test("throws yaml-lite's own error on an invalid escape sequence inside a double-quoted scalar, not a bare JSON SyntaxError", () => {
+  // Found by fuzzing: '"a\qb"' closes its quote fine (hasClosingQuote only
+  // tracks whether the quote closes, not whether each escape is valid),
+  // so it reaches the JSON.parse fast path — but \q isn't a JSON escape,
+  // and JSON.parse throws its own uncaught SyntaxError instead of this
+  // file's "yaml-lite: ..." convention every other rejection follows.
+  // Verified against yaml.safe_load('a: "a\\qb"\n'), which also rejects
+  // this (a ScannerError — \q isn't a YAML double-quoted escape either),
+  // so throwing here is correct; the fix is only about *which* error.
+  assert.throws(
+    () => parseWorkflowYaml('a: "a\\qb"\n'),
+    /invalid escape sequence/,
+  );
+  // A scalar using only real escapes must still parse.
+  assert.equal(parseWorkflowYaml('a: "a\\tb"\n').a, "a\tb");
+});
+
+test("throws a clearly-scoped error on an implicit multi-line plain scalar block value, not a confusing generic one", () => {
+  // "a:\n  free text\n  more text\n" is real, valid YAML — verified against
+  // yaml.safe_load, which folds it to {'a': 'free text more text'}, using a
+  // DIFFERENT folding rule than this file's own ">" support (a more-
+  // indented line inside this construct folds to a plain space, unlike a
+  // ">"-folded scalar's "more-indented lines break the fold" behavior —
+  // yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
+  // {'a': 'line one indented line two'}, not the ">"-style hard break).
+  // Reusing the ">" folding logic here would be quietly wrong, not merely
+  // unimplemented, so this is out of this parser's scope rather than a
+  // guess at a construct with its own subtle rules. Before this check
+  // existed, the same input still failed — just via splitKeyValue's
+  // generic "could not parse mapping entry: ..." error, found by fuzzing.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n  more text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // A single-line implicit scalar hits the exact same construct (its
+  // "block" is just one line) and is equally out of scope.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // Contrast: a deeper block whose first line genuinely looks like a
+  // mapping key ("key: value" or bare "key:") is unaffected — that's the
+  // ordinary nested-mapping case this parser has always supported.
+  const doc = parseWorkflowYaml("a:\n  b: 1\n");
+  assert.equal(doc.a.b, 1);
 });
 
 test("accepts an empty flow mapping as a value, and throws on a non-empty one", () => {
