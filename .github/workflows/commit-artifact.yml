@@ -575,7 +575,23 @@ jobs:
           # change was doing). The lease makes the push fail instead of
           # guessing whenever the remote ref isn't still exactly what the
           # guard saw.
-          git push --force-with-lease="$BRANCH_REF:$EXPECTED_HEAD_SHA" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$BRANCH_REF"
+          #
+          # refs/heads/$BRANCH_REF, not the bare $BRANCH_REF, on both sides:
+          # an unqualified push destination is resolved the same way a local
+          # ref is, so a branch-ref that happens to collide with an existing
+          # TAG name (and no branch of that name) pushes into refs/tags/
+          # instead — verified directly: `git push --force
+          # origin HEAD:release` silently force-updated an existing
+          # `refs/tags/release` when only a tag by that name existed. Every
+          # earlier guard (expected-head-sha, the checkout itself) still
+          # passes in that shape, since none of them look at which
+          # namespace the ref resolved into. Qualifying both sides closes
+          # it: the lease's expected SHA is checked against refs/heads/…
+          # specifically, so a branch-ref that only exists as a tag has no
+          # matching branch to satisfy the lease and the push is rejected
+          # ("stale info") instead of touching the tag — verified with the
+          # same repro.
+          git push --force-with-lease="refs/heads/$BRANCH_REF:$EXPECTED_HEAD_SHA" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH_REF"
           echo "committed=true" >> "$GITHUB_OUTPUT"
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
