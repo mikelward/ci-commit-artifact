@@ -227,8 +227,22 @@ jobs:
           HAS_PUSH_TOKEN: ${{ secrets.push-token != '' }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "pull_request_target" ] && [ -n "$DISPATCH_WORKFLOW" ] && [ "$HAS_PUSH_TOKEN" != "true" ]; then
-            echo "::error::this run was triggered by pull_request_target and dispatch-workflow is set, but no push-token secret was given. Dispatching onto branch-ref under pull_request_target would run that branch's own (potentially PR-controlled) copy of the workflow file with dispatch-workflow's elevated permissions -- pass a push-token secret (see its description) instead of relying on dispatch-workflow here."
+          # Allowlist, not a denylist of the one trigger this was first
+          # written to catch: the push-token secret's own description
+          # documents dispatch-without-a-token as safe ONLY when the
+          # caller's trigger is 'pull_request' (there, the workflow file
+          # that actually runs is already the branch's own copy, so a
+          # dispatch onto that same branch grants no new trust) -- every
+          # OTHER trigger reads the workflow definition from the default
+          # branch instead (pull_request_target explicitly, but also
+          # workflow_run, schedule, issue_comment, repository_dispatch, and
+          # any future one), so a dispatch onto branch-ref there can run
+          # that branch's own, potentially untrusted, copy with this run's
+          # permissions. Codex review: the original check only excluded
+          # pull_request_target by name, so every other non-pull_request
+          # trigger sailed through the same unsafe path unchecked.
+          if [ "$EVENT_NAME" != "pull_request" ] && [ -n "$DISPATCH_WORKFLOW" ] && [ "$HAS_PUSH_TOKEN" != "true" ]; then
+            echo "::error::this run's trigger ('$EVENT_NAME') is not pull_request and dispatch-workflow is set, but no push-token secret was given. Dispatching onto branch-ref is only safe when the calling workflow's own trigger is pull_request -- there, the workflow file that runs is already the PR branch's own copy. Any other trigger (pull_request_target, workflow_run, schedule, a manually-run one, or anything else) may instead execute branch-ref's own, potentially untrusted, copy of the workflow file with this run's elevated permissions -- pass a push-token secret (see its description) instead of relying on dispatch-workflow here."
             exit 1
           fi
           # actions/download-artifact reads `!!inputs.name` to decide whether
