@@ -976,6 +976,27 @@ test("the freshness comment never runs without both a marker and a PR number", (
   );
 });
 
+test("the existing sticky comment is found by an anchored marker match, not a bare substring", () => {
+  // Codex review: comment-marker is caller-chosen, and the body is always
+  // built as `${marker}\n...` -- a bare .includes(marker) would also match
+  // an unrelated bot comment that merely happens to CONTAIN the marker text
+  // somewhere in its own content (another automation's output, or a
+  // different caller's longer marker that this one is a substring of), and
+  // then overwrite that comment's content instead of posting or updating
+  // this workflow's own.
+  const script = step("Comment freshness on the PR").with.script;
+  assert.doesNotMatch(
+    script,
+    /c\.body\.includes\(marker\)/,
+    "still a bare substring search -- a marker occurring anywhere in an unrelated bot comment would match",
+  );
+  assert.match(
+    script,
+    /c\.body\.startsWith\(`\$\{marker\}\\n`\)/,
+    "must anchor to the exact start of the body, matching how it's actually constructed just above",
+  );
+});
+
 // Anchored on the actual status-line assignment, not the bare substring
 // "up-to-date" — that phrase also appears inside nearby comments explaining
 // *why* the checks above it exist, and indexOf() would find those instead.
