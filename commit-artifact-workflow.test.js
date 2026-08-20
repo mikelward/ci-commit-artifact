@@ -943,7 +943,103 @@ test("the push is a lease pinned to the exact SHA the guard step verified, not a
   // silently resurrect or undo whatever the intervening change was doing.
   const commitStep = step("Commit and push");
   assert.match(commitStep.env["EXPECTED_HEAD_SHA"], /inputs\.expected-head-sha/);
-  assert.match(commitStep.run, /--force-with-lease="\$BRANCH_REF:\$EXPECTED_HEAD_SHA"/);
+  assert.match(
+    commitStep.run,
+    /--force-with-lease="refs\/heads\/\$BRANCH_REF:\$EXPECTED_HEAD_SHA"/,
+  );
+});
+
+test("both sides of the push are qualified refs/heads/ refs, not bare names an unqualified refspec could resolve into refs/tags/ instead", () => {
+  // Codex review: an unqualified push destination is resolved the same way
+  // a local ref name is, so a branch-ref that happens to collide with an
+  // EXISTING TAG of the same name (and no branch of that name) pushes into
+  // refs/tags/ instead of refs/heads/ — verified directly against real git
+  // (see the execution regression below). Every earlier guard passes in
+  // that shape, since none of them look at which namespace the checked-out
+  // ref actually resolved into.
+  const commitStep = step("Commit and push");
+  assert.match(commitStep.run, /"HEAD:refs\/heads\/\$BRANCH_REF"/);
+  assert.doesNotMatch(commitStep.run, /"HEAD:\$BRANCH_REF"/);
+});
+
+test("a branch-ref colliding with an existing tag of the same name is rejected, not pushed into refs/tags/", () => {
+  // End-to-end regression for the Codex finding above, executing the
+  // step's own script (not a hand-typed reproduction) against a real git
+  // remote. Redirects the hardcoded github.com push URL to a local bare
+  // repo via `url.<base>.insteadOf`, so the actual push line runs for
+  // real instead of only being regex-matched.
+  const bareRemote = fs.mkdtempSync(path.join(os.tmpdir(), "commit-tagcollision-remote-"));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-tagcollision-work-"));
+  const pushUrl = "https://x-access-token:faketoken@github.com/test-owner/test-repo.git";
+  try {
+    execFileSync("git", ["init", "-q", "--bare", "."], { cwd: bareRemote });
+
+    execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+    fs.mkdirSync(path.join(workspace, "out"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "out", "README.md"), "hi");
+    execFileSync("git", ["add", "out/README.md"], { cwd: workspace });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: workspace });
+    const tagSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: workspace })
+      .toString()
+      .trim();
+    // Push that commit to the bare remote as a TAG named "release" —
+    // deliberately no branch of that name exists there.
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/tags/release"], {
+      cwd: workspace,
+    });
+    execFileSync("git", ["config", `url.${bareRemote}.insteadOf`, pushUrl], {
+      cwd: workspace,
+    });
+    fs.mkdirSync(path.join(workspace, "out", "example"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "out", "example", "real.txt"), "y");
+
+    const commitStep = step("Commit and push");
+    const result = { code: 0, output: "" };
+    try {
+      result.output = execFileSync("bash", ["-c", commitStep.run], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          GITHUB_WORKSPACE: workspace,
+          DEST_PATH: "out/example",
+          GIT_LITERAL_PATHSPECS: "1",
+          BRANCH_REF: "release",
+          COMMIT_MESSAGE: "m",
+          // The worst case: the guard step's SHA comparison would have let
+          // this through, since it never looks at which namespace
+          // branch-ref resolved into.
+          EXPECTED_HEAD_SHA: tagSha,
+          GH_TOKEN: "faketoken",
+          GITHUB_REPOSITORY: "test-owner/test-repo",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }).toString();
+    } catch (e) {
+      result.code = e.status;
+      result.output = String(e.stdout || "") + String(e.stderr || "");
+    }
+
+    assert.notEqual(result.code, 0, "the push must fail rather than silently rewrite the tag");
+    const tagAfter = execFileSync("git", ["rev-parse", "refs/tags/release"], {
+      cwd: bareRemote,
+    })
+      .toString()
+      .trim();
+    assert.equal(tagAfter, tagSha, "refs/tags/release on the remote must be untouched");
+    assert.throws(
+      () =>
+        execFileSync("git", ["show-ref", "--verify", "--quiet", "refs/heads/release"], {
+          cwd: bareRemote,
+          stdio: ["ignore", "ignore", "ignore"],
+        }),
+      "refs/heads/release must not have been created either",
+    );
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 test("CI is dispatched only after a real commit, and only when the caller asked for it", () => {
