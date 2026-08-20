@@ -526,6 +526,39 @@ test("throws on a tab in a line's indentation, including when the tab is the lin
   );
 });
 
+test("a tab past a block scalar's own established margin is content, not indentation", () => {
+  // Found by fuzzing: the original tab check ran globally over every raw
+  // line before any block-scalar context existed, so a tab used as literal
+  // script content deep inside a run: | block (past the block's own
+  // established margin) was rejected as if it were indentation. Verified
+  // against yaml.safe_load("run: |\n  echo hi\n  \techo bye\n") ->
+  // {'run': 'echo hi\n\techo bye\n'} — the tab is payload.
+  const doc = parseWorkflowYaml("run: |\n  echo hi\n  \techo bye\n");
+  assert.equal(doc.run, "echo hi\n\techo bye\n");
+});
+
+test("a tab still rejects when it establishes a block scalar's own first-line margin", () => {
+  // Contrast with the case above: a tab that IS the block's margin (nothing
+  // has been established yet) is genuine indentation, and real YAML still
+  // rejects it — verified against yaml.safe_load("run: |\n\techo hi\n"),
+  // a ScannerError ("found character '\t' that cannot start any token").
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n\techo hi\n"),
+    /tab in indentation/,
+  );
+});
+
+test("a tab at a block scalar's dedent boundary still rejects, even with content after it", () => {
+  // The established margin is 2; this line's leading run is "\t " (a tab
+  // then a space) before "y" — genuinely part of the region that decides
+  // continuation vs. dedent, not payload past the margin, so it must still
+  // be rejected the same as any other structural tab.
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n  x\n\t y\n"),
+    /tab in indentation/,
+  );
+});
+
 test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
   // `name: "example` (no closing quote) previously fell through every
   // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since
