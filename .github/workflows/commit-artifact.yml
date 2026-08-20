@@ -750,7 +750,14 @@ jobs:
               core.warning(`Could not list PR comments (${e.message}); skipping the freshness comment rather than risking a duplicate.`);
               return;
             }
-            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
+            // Anchored to the exact start of the body, not a bare substring
+            // search (Codex review): the body is always constructed as
+            // `${marker}\n...` just above, so a marker appearing anywhere
+            // else in an unrelated bot comment -- another automation's own
+            // output, or a different comment-marker that happens to contain
+            // this one as a substring -- can no longer be mistaken for this
+            // workflow's own sticky comment and have its content overwritten.
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.startsWith(`${marker}\n`));
 
             // Re-checked here — as the LAST thing before writing, after
             // listComments has already resolved — rather than once up top
