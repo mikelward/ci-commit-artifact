@@ -11,22 +11,38 @@ time). Rewiring clothescast to call `commit-artifact.yml` instead — moving
 its own Roborazzi-snapshot upload/commit steps to use this workflow — is the
 actual point and hasn't been done yet.
 
-## Port yaml-lite.js to sibling repos
+## Port yaml-lite.js to sibling repos — done, extracted to its own repo
 
-`npm-update/npm-update-workflow.test.js` and `gedmap/.github/workflows/npm-update.test.js`
-test their own reusable-workflow YAML the same way this repo's tests used to
-— regex/string-matching over the serialized text — and that approach
-produced a real, broken test here (an unbounded lazy match that could span
-past the input it was checking). Both are pure-JS repos, same shape as this
-one, so `yaml-lite.js` (or a copy of it, ported by hand — there's no shared
-package registry across this fleet, same reason `vitest-shim.mjs` is
-duplicated rather than imported) is the natural fix once this repo has
-proven it in real use for a while. Not urgent; their existing tests aren't
-known to be wrong today, just fragile in the same way this one was.
+`yaml-lite.js` is now maintained in `mikelward/yaml-lite`, the canonical
+source — vendored back into this repo and into `mikelward/npm-update`. Fix a
+bug there first, then re-sync both vendored copies (see this repo's own
+`AGENTS.md`). `gedmap`/`readmo`/`newshacker`/`homepage` were considered too,
+but they already carry a real dependency graph (`package.json`), so `js-yaml`
+(a real, spec-compliant library) is the better fit there rather than
+vendoring this hand-rolled subset parser — see `mikelward/yaml-lite`'s
+README for the reasoning.
 
 Python-based repos (`web`) are a separate case: PyYAML is a genuine
 zero-cost option there since Python is already the production runtime, not
 a second runtime taken on for test convenience the way it would be here.
+
+## Executable bits are silently dropped across the artifact handoff
+
+Codex review (2026-08-20, on `.github/workflows/commit-artifact.yml:366`):
+`actions/upload-artifact`/`download-artifact` normalizes every file to mode
+0644, so an executable file in the rendered output loses its executable bit
+by the time `download-artifact` extracts it here — a 100755→100644 change
+that `git add` then stages silently, and a newly-generated executable can
+never be committed as executable at all. Real finding, not yet fixed: fixing
+it properly changes the artifact contract (either the caller uploads a tar
+archive instead of raw files, restoring modes on extraction here instead of
+relying on `download-artifact`'s raw multi-file handling, or a permissions
+manifest alongside the artifact that this workflow chmods from after
+extraction) — a design decision for every consumer of this reusable
+workflow, not a same-PR mechanical fix. Needs a decision on which shape
+(archive vs. manifest) before landing, and whether it's worth the added
+complexity given how rare committed executables actually are in this
+workflow's real usage today.
 
 ## Remaining forbidden plain-scalar starters in yaml-lite.js
 
