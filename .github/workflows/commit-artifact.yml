@@ -140,7 +140,11 @@ on:
       commit-sha:
         description: >-
           The resulting head of branch-ref: the new commit if one was
-          pushed, otherwise its unchanged current head.
+          pushed, otherwise its unchanged current head -- EXCEPT when
+          branch-ref no longer exists at all (deleted mid-run, e.g. its PR
+          merged or closed), where there is no current head to report and
+          this is instead the last head this run actually observed
+          branch-ref at, before it was deleted.
         value: ${{ jobs.commit.outputs.commit_sha }}
 
 jobs:
@@ -159,8 +163,8 @@ jobs:
       # moved branch, or a failed/missing download) — steps.commit.outputs.committed
       # is unset in that case, and the documented contract promises 'false'
       # there, not an empty string a caller's == 'false' check would miss.
-      committed: ${{ steps.commit.outputs.committed || 'false' }}
-      commit_sha: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
+      committed: ${{ steps.commit.outputs.committed || steps.checkout-guard.outputs.committed || 'false' }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha || steps.checkout-guard.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
     steps:
       - name: Validate the input combination
         id: validate
@@ -231,6 +235,10 @@ jobs:
           # for emptiness, via a bare shell string comparison rather than a
           # command whose argv or output could land in the run log.
           HAS_PUSH_TOKEN: ${{ secrets.push-token != '' }}
+          # Read-only: github.token always has at least read access to this
+          # job's own repository under the permissions block above,
+          # regardless of whether a caller supplied push-token.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Allowlist, not a denylist of the one trigger this was first
@@ -282,9 +290,75 @@ jobs:
           # (and every real run) that exercises any check below this line,
           # for a value that a failing run never needed in the first place.
           echo "use_push_token=$HAS_PUSH_TOKEN" >> "$GITHUB_OUTPUT"
+          # Whether refs/heads/$BRANCH_REF exists RIGHT NOW, before checkout
+          # or anything else in this job has touched it. This is the only
+          # reliable way for "Commit and push" (much later) to tell a real
+          # branch that vanishes partway through this job (the PR merging or
+          # closing while checkout/build/commit are still running) apart
+          # from branch-ref naming something that only ever existed as a
+          # TAG -- a caller misconfiguration that step's refs/heads/
+          # qualification is designed to reject loudly, not swallow.
+          # Checking this later -- e.g. right before that step's own push --
+          # can't tell them apart: `actions/checkout`'s `ref: branch-ref`
+          # doesn't discriminate branch from tag either, and by then a real
+          # branch could just as easily have been deleted already too.
+          # git ls-remote's ref argument matches as a SUFFIX pattern, not an
+          # exact ref name (verified directly): a real branch named e.g.
+          # "a/refs/heads/$BRANCH_REF" also matches a query for
+          # "refs/heads/$BRANCH_REF" and is returned alongside (or instead
+          # of, in whatever order the remote lists them) the real one --
+          # Codex review. --exit-code's own success/failure can't be
+          # trusted here, since it only reports whether ANYTHING matched,
+          # not whether the EXACT ref did. Every returned line is checked
+          # for an exact refs/heads/$BRANCH_REF match in the second field
+          # instead.
+          #
+          # A failure to even RUN the query (auth, transport) is recorded as
+          # its own 'unknown' value, distinct from 'false' -- Codex review:
+          # collapsing a probe failure into the same 'false' a genuine
+          # not-found produces means a branch that later vanishes for real
+          # gets diagnosed with "did not exist at the start either" even
+          # though this never actually checked that. 'unknown' still fails
+          # the job later just as 'false' does (this workflow's fail-closed
+          # default: never silently swallow a disappearance this step
+          # couldn't rule out), but the failure message stays honest about
+          # which case it is.
+          if remote_output=$(git ls-remote "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/$BRANCH_REF" 2>&1); then
+            exact_line=$(printf '%s\n' "$remote_output" | awk -v want="refs/heads/$BRANCH_REF" '$2 == want { print; exit }')
+            if [ -n "$exact_line" ]; then
+              echo "branch_existed_at_start=true" >> "$GITHUB_OUTPUT"
+              # Codex review: if branch-ref had already moved past
+              # expected-head-sha by the time THIS probe ran (a distinct,
+              # earlier race from the one branch_existed_at_start exists
+              # for) and vanishes before checkout-guard gets its own
+              # chance to look, checkout-guard has nothing left to observe
+              # and would otherwise fall back to reporting the workflow's
+              # original expected-head-sha input as commit_sha -- stale by
+              # the time this run actually started, not "the last head
+              # this run actually observed" its own documented contract
+              # promises. Capturing the SHA this probe itself saw is what
+              # lets checkout-guard report the truth instead.
+              echo "branch_sha_at_start=${exact_line%%[[:space:]]*}" >> "$GITHUB_OUTPUT"
+            else
+              echo "branch_existed_at_start=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::could not query refs/heads/$BRANCH_REF on the remote to check whether it exists yet: $remote_output -- recording this as unconfirmed, not as 'does not exist', so a later disappearance is diagnosed honestly instead of blamed on a branch this never actually checked."
+            echo "branch_existed_at_start=unknown" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check out the branch
         id: checkout
+        # continue-on-error, so a branch that vanished before or during this
+        # checkout doesn't fail the job outright before the next step gets a
+        # chance to tell that apart from a real checkout failure -- Codex
+        # review: the graceful vanished-branch handling this workflow
+        # already has lives entirely in "Commit and push", many steps
+        # later, so a branch that vanishes in THIS window (not narrow — the
+        # render job that triggers this one can run for minutes first)
+        # skipped straight past all of it and failed the job on a raw
+        # checkout error instead.
+        continue-on-error: true
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.branch-ref }}
@@ -300,8 +374,68 @@ jobs:
           # checkout's credential.
           persist-credentials: false
 
+      - name: Handle a branch-ref that vanished before or during checkout
+        id: checkout-guard
+        if: steps.checkout.outcome != 'success'
+        env:
+          BRANCH_REF: ${{ inputs.branch-ref }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+          BRANCH_EXISTED_AT_START: ${{ steps.validate.outputs.branch_existed_at_start }}
+          # The SHA the validate step's own probe actually saw branch-ref
+          # at, when it found one -- Codex review: if branch-ref had
+          # already moved past expected-head-sha by the time that earlier
+          # probe ran, and then vanished before this step's own re-probe,
+          # this step has nothing left to observe itself and would
+          # otherwise fall back to the workflow's original (by-then-stale)
+          # expected-head-sha input, contradicting commit-sha's documented
+          # "last head this run actually observed" contract.
+          BRANCH_SHA_AT_START: ${{ steps.validate.outputs.branch_sha_at_start }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # checkout above failed -- for ANY reason, a missing ref being
+          # only one. Re-probe the remote the same way "Commit and push"
+          # does later in this job, to draw the same
+          # vanished/never-existed/unknown distinction one step earlier,
+          # against the validate step's own early read (captured before
+          # checkout ever touched branch-ref, so it can tell a real
+          # deletion apart from a branch-ref that only ever existed as a
+          # TAG -- see that step's own comment for why a check made now
+          # can't).
+          push_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if ! remote_output=$(git ls-remote "$push_url" "refs/heads/$BRANCH_REF" 2>&1); then
+            echo "::error::checkout of refs/heads/$BRANCH_REF failed, and could not query the remote to diagnose why:"
+            echo "$remote_output" | sed 's/^/::error::  /'
+            exit 1
+          fi
+          exact_line=$(printf '%s\n' "$remote_output" | awk -v want="refs/heads/$BRANCH_REF" '$2 == want { print; exit }')
+          if [ -n "$exact_line" ]; then
+            echo "::error::checkout of refs/heads/$BRANCH_REF failed for a reason other than the branch vanishing (it still exists on the remote) -- see the checkout step's own log above; a real failure, not a benign deletion."
+            exit 1
+          fi
+          if [ "$BRANCH_EXISTED_AT_START" = "true" ]; then
+            echo "::warning::refs/heads/$BRANCH_REF no longer exists on the remote (likely merged or closed) -- checkout failed for exactly that reason. Skipping the rest of this run; there is nothing left to sync."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            # Not the resulting current head -- there isn't one -- but the
+            # last head this run actually observed branch-ref at, same
+            # caveat as "Commit and push"'s own vanished-branch case.
+            # BRANCH_SHA_AT_START (the validate step's own probe result),
+            # not EXPECTED_HEAD_SHA (a workflow input, potentially already
+            # stale by the time this run even started) -- Codex review.
+            echo "commit_sha=${BRANCH_SHA_AT_START:-$EXPECTED_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "raced=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$BRANCH_EXISTED_AT_START" = "unknown" ]; then
+            echo "::error::checkout of refs/heads/$BRANCH_REF failed, and the validate step's own early probe could not confirm whether it existed at the start of this run either (that probe failed to even run -- see its warning earlier in this job). Treating this as a real failure rather than guessing it was a benign deletion."
+            exit 1
+          fi
+          echo "::error::checkout of refs/heads/$BRANCH_REF failed, and it did not exist at the start of this run either -- branch-ref likely names something that only exists as a tag or other non-branch ref, so this is a real failure, not a vanished branch."
+          exit 1
+
       - name: Refuse to act on an untested branch head
         id: guard
+        if: steps.checkout.outcome == 'success'
         env:
           # git's check-ref-format allows characters like ', $, ;, |, & and
           # backticks in a branch name, so a same-repo collaborator could
@@ -323,7 +457,11 @@ jobs:
 
       - name: Empty the destination before extracting the artifact
         id: clear
-        if: steps.guard.outputs.skip != 'true'
+        # steps.guard.outputs.skip is unset (not 'true') when guard itself
+        # was skipped because checkout failed -- '' != 'true' is TRUE in
+        # Actions expressions, so without the checkout.outcome term this
+        # step would run against a checkout that never happened.
+        if: steps.checkout.outcome == 'success' && steps.guard.outputs.skip != 'true'
         env:
           DEST_PATH: ${{ inputs.dest-path }}
         # download-artifact EXTRACTS into dest-path, it doesn't replace it —
@@ -431,7 +569,7 @@ jobs:
 
       - name: Download the artifact
         id: download
-        if: steps.guard.outputs.skip != 'true'
+        if: steps.checkout.outcome == 'success' && steps.guard.outputs.skip != 'true'
         uses: actions/download-artifact@v6
         with:
           name: ${{ inputs.artifact-name }}
@@ -453,7 +591,7 @@ jobs:
 
       - name: Commit and push
         id: commit
-        if: steps.guard.outputs.skip != 'true' && steps.download.outcome == 'success'
+        if: steps.checkout.outcome == 'success' && steps.guard.outputs.skip != 'true' && steps.download.outcome == 'success'
         env:
           # push-token when the caller supplied one, so the push authenticates
           # as a real user (retriggers pull_request/pull_request_target
@@ -471,6 +609,10 @@ jobs:
           DEST_PATH: ${{ inputs.dest-path }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+          # From the validate step's own early read, not re-derived here:
+          # see that step's comment for why this has to be captured before
+          # checkout, not right before this step's own push.
+          BRANCH_EXISTED_AT_START: ${{ steps.validate.outputs.branch_existed_at_start }}
           # `--` before a pathspec only tells git "no more options follow" —
           # it does NOT make the pathspec's own text literal. A dest-path a
           # caller literally names with git's pathspec magic syntax (e.g.
@@ -632,9 +774,113 @@ jobs:
           # matching branch to satisfy the lease and the push is rejected
           # ("stale info") instead of touching the tag — verified with the
           # same repro.
-          git push --force-with-lease="refs/heads/$BRANCH_REF:$EXPECTED_HEAD_SHA" "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH_REF"
-          echo "committed=true" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          push_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          pushed_sha=$(git rev-parse HEAD)
+          if git push --force-with-lease="refs/heads/$BRANCH_REF:$EXPECTED_HEAD_SHA" "$push_url" "HEAD:refs/heads/$BRANCH_REF"; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=$pushed_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The lease can reject for a reason that isn't this workflow's to
+          # fail on: branch-ref can vanish entirely (the PR it belongs to
+          # merged or closed while this job was still running — GitHub
+          # auto-deletes the head branch on merge) or advance past
+          # EXPECTED_HEAD_SHA because something else legitimately pushed to
+          # it in the same window (this job races nothing, but a caller's
+          # own concurrent runs can). Both are "someone else already
+          # resolved this, there is nothing left to sync" rather than "the
+          # sync mechanism is broken" — ported from a caller in this fleet
+          # (typelauncher) that hit exactly the first case in production
+          # before this workflow existed and had to solve it inline.
+          #
+          # git ls-remote's ref argument matches as a SUFFIX pattern, not an
+          # exact ref name (verified directly, same as the validate step's
+          # early read above): a real branch named e.g.
+          # "a/refs/heads/$BRANCH_REF" also matches a query for
+          # "refs/heads/$BRANCH_REF", so --exit-code's own success/failure
+          # (and blindly taking the first returned line's SHA) can pick up
+          # an unrelated ref entirely — Codex review. Every returned line is
+          # checked for an exact refs/heads/$BRANCH_REF match in the second
+          # field instead; ls-remote's own exit status here means only
+          # "could the remote be reached at all" (auth, transport), not
+          # anything about which refs matched.
+          if ! remote_output=$(git ls-remote "$push_url" "refs/heads/$BRANCH_REF" 2>&1); then
+            echo "::error::Could not query refs/heads/$BRANCH_REF on the remote to diagnose the push failure — treating this as a real failure rather than guessing:"
+            echo "$remote_output" | sed 's/^/::error::  /'
+            exit 1
+          fi
+          exact_line=$(printf '%s\n' "$remote_output" | awk -v want="refs/heads/$BRANCH_REF" '$2 == want { print; exit }')
+          if [ -z "$exact_line" ] && [ "$BRANCH_EXISTED_AT_START" = "true" ]; then
+            echo "::warning::refs/heads/$BRANCH_REF no longer exists on the remote (likely merged or closed while this job ran) — skipping the push; there is no branch left to sync."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            # Not the resulting current head -- there isn't one, the branch
+            # is gone -- but the last head this run actually observed
+            # branch-ref at, per this output's documented caveat above.
+            echo "commit_sha=$EXPECTED_HEAD_SHA" >> "$GITHUB_OUTPUT"
+            # Codex review: distinct from the ordinary "nothing to commit"
+            # case (git diff found no changes) -- this run DID have
+            # something to commit, but branch-ref moved out from under it,
+            # so the freshness comment below must defer to whichever run
+            # is responsible for that new state instead of reporting this
+            # as a plain up-to-date no-op.
+            echo "raced=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$exact_line" ]; then
+            # Distinguished from the vanished-branch case above by the
+            # validate step's OWN early read (BRANCH_EXISTED_AT_START), not
+            # by re-checking now: a branch-ref that only ever existed as a
+            # TAG (the refs/heads/-qualification fix above) also makes
+            # refs/heads/$BRANCH_REF report "not found" here, identical to a
+            # real branch vanishing -- but a re-check at this late point
+            # can't tell them apart, since by now a real branch could
+            # equally have been deleted already. Only a read taken before
+            # checkout ever touched branch-ref can.
+            #
+            # BRANCH_EXISTED_AT_START can also be 'unknown' (the validate
+            # step's own probe failed to even run, e.g. auth or transport) --
+            # Codex review: reporting that case with the same "did not exist
+            # at the start either" wording as a genuine tag-only branch-ref
+            # would be a false claim, since this never actually confirmed
+            # that. Still a hard failure either way (this workflow's
+            # fail-closed default), just an honest one about which case it is.
+            if [ "$BRANCH_EXISTED_AT_START" = "unknown" ]; then
+              echo "::error::refs/heads/$BRANCH_REF does not exist on the remote now, and the validate step's own early probe could not confirm whether it existed at the start of this run either (that probe failed to even run — see its warning earlier in this job). Treating this as a real failure rather than guessing it was a benign deletion."
+            else
+              echo "::error::refs/heads/$BRANCH_REF does not exist on the remote and did not exist at the start of this run either — branch-ref likely names something that only exists as a tag or other non-branch ref; the push cannot be diverted into that namespace instead (see the refs/heads/ qualification above), so this is a real failure, not a vanished branch."
+            fi
+            exit 1
+          fi
+          actual_sha="${exact_line%%[[:space:]]*}"
+          # Codex review: git push can exit nonzero even though the update
+          # actually landed server-side (e.g. the connection drops after
+          # GitHub accepts it but before the client reads the response) --
+          # checked first, ahead of the lost-race/real-failure checks below,
+          # both of which would otherwise misreport a push that in fact
+          # succeeded: as a lost race (the remote isn't at EXPECTED_HEAD_SHA
+          # any more -- it's at OUR new commit) with committed=false, which
+          # would also wrongly skip dispatching CI on it.
+          if [ "$actual_sha" = "$pushed_sha" ]; then
+            echo "::warning::refs/heads/$BRANCH_REF already reports this run's own new commit even though git push exited nonzero — treating it as pushed rather than retrying or reporting a false failure."
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=$pushed_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$actual_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            # Codex review: reports the SHA this probe actually found, not
+            # the stale EXPECTED_HEAD_SHA -- the documented commit-sha
+            # contract promises branch-ref's current head when this run
+            # doesn't push, and EXPECTED_HEAD_SHA is what the guard step
+            # observed before this run even started, not what's there now.
+            echo "::warning::refs/heads/$BRANCH_REF advanced past $EXPECTED_HEAD_SHA since the guard step observed it — skipping this push; whatever run produced that newer head is responsible for its own sync."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=$actual_sha" >> "$GITHUB_OUTPUT"
+            # See the vanished-branch case above for why this is set.
+            echo "raced=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::Push to refs/heads/$BRANCH_REF failed even though the remote still reports it at the expected SHA — not a vanished branch, a lost race, or an unconfirmed success, so this is a real failure (auth, branch protection, or network)."
+          exit 1
 
       - name: Dispatch CI on the new commit
         # Only when the push used GITHUB_TOKEN: a push-token push already
@@ -676,12 +922,25 @@ jobs:
           ARTIFACT_NOUN: ${{ inputs.artifact-noun }}
           PR_NUMBER: ${{ inputs.pr-number }}
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          # Distinct from RACED below (which also merges in this same
+          # value): this one's checked ahead of, and independently from,
+          # the ordinary CHECKOUT_OUTCOME/SKIPPED/RACED chain, specifically
+          # to keep the two branch-conditions' literal source text from
+          # colliding (this file's own regression tests locate each branch
+          # by searching for its exact condition string).
+          CHECKOUT_GUARD_RACED: ${{ steps.checkout-guard.outputs.raced }}
           GUARD_OUTCOME: ${{ steps.guard.outcome }}
           CLEAR_OUTCOME: ${{ steps.clear.outcome }}
           SKIPPED: ${{ steps.guard.outputs.skip }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
           COMMIT_OUTCOME: ${{ steps.commit.outcome }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
+          # Set when EITHER the commit step detected branch-ref moving or
+          # vanishing between the guard step's check and its own push, OR
+          # checkout-guard detected it had already vanished before checkout
+          # even ran -- see each step's own comments for why this can't be
+          # inferred from COMMITTED alone.
+          RACED: ${{ steps.commit.outputs.raced || steps.checkout-guard.outputs.raced }}
           HEAD_SHA: ${{ steps.commit.outputs.commit_sha || steps.guard.outputs.actual_head_sha }}
           # A WORKFLOW INPUT, not a step output — unlike HEAD_SHA (unset
           # when guard never completed), this is always present regardless
@@ -729,7 +988,17 @@ jobs:
             // matches it, nothing has moved and this failure is exactly what
             // the PR's current state needs reported; if not, a newer run
             // already owns the report.
-            if (process.env.CHECKOUT_OUTCOME !== 'success' || process.env.GUARD_OUTCOME !== 'success' || process.env.CLEAR_OUTCOME === 'failure') {
+            if (process.env.CHECKOUT_OUTCOME !== 'success' && process.env.CHECKOUT_GUARD_RACED === 'true') {
+              // checkout-guard classified this checkout failure as
+              // branch-ref genuinely vanishing before checkout could even
+              // run -- same reasoning as the post-guard RACED branch
+              // further down: whichever run is responsible for that new
+              // state reports on it, not this one, so posting here (even
+              // the "an earlier step failed" warning below) risks
+              // overwriting that other run's already-accurate report.
+              core.info(`branch-ref vanished before checkout could run — the run responsible for that state reports, not this one. Skipping the freshness comment.`);
+              return;
+            } else if (process.env.CHECKOUT_OUTCOME !== 'success' || process.env.GUARD_OUTCOME !== 'success' || process.env.CLEAR_OUTCOME === 'failure') {
               needsLiveHeadCheck = true;
               referenceHeadSha = process.env.EXPECTED_HEAD_SHA;
               status = `⚠️ An earlier step failed before the artifact could be checked — see the run log.`;
@@ -785,6 +1054,19 @@ jobs:
                 status = `⚠️ The commit step failed after a successful download — check the run log.`;
               } else if (process.env.COMMITTED === 'true') {
                 status = `🔄 Regenerated ${noun}s this run.`;
+              } else if (process.env.RACED === 'true') {
+                // Codex review: the commit step had real changes to push,
+                // but branch-ref moved (vanished, or advanced past
+                // expected-head-sha) between the guard step's check and
+                // the actual push -- reported as committed=false, which
+                // is accurate, but NOT the same as "nothing to commit".
+                // Same reasoning as the guard-stage SKIPPED branch above:
+                // whichever run is responsible for branch-ref's new state
+                // reports on it, not this one, so posting anything here
+                // (even after the live-head check below) risks
+                // overwriting that other run's already-accurate report.
+                core.info(`branch-ref changed between the guard step and the push — the run responsible for that state reports, not this one. Skipping the freshness comment.`);
+                return;
               } else {
                 status = `✅ ${noun}s up-to-date — no changes from this push.`;
               }

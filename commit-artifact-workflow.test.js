@@ -29,6 +29,22 @@ function step(name) {
   return s;
 }
 
+// The validate step's own early read (branch_existed_at_start) reaches out
+// to a real https://github.com/... URL, which most tests below have no
+// opinion about and shouldn't depend on real network reachability to run
+// (this sandbox happens to have egress, but that's not guaranteed, and even
+// where it does the round trip is real latency for a value these tests
+// never check). A GIT_CONFIG_GLOBAL pointing every "https://x-access-token:"
+// URL (a fixed prefix regardless of the token/repo that follows) at a
+// nonexistent local path makes that call fail fast and deterministically,
+// with no network involved -- verified directly (a bogus HTTPS_PROXY was
+// tried first and did NOT reliably block the real connection; this does).
+const NO_NETWORK_GIT_CONFIG = path.join(os.tmpdir(), "commit-artifact-test-no-network-gitconfig");
+fs.writeFileSync(
+  NO_NETWORK_GIT_CONFIG,
+  '[url "file:///nonexistent-test-remote/"]\n\tinsteadOf = https://x-access-token:\n',
+);
+
 test("is callable only via workflow_call, not directly triggerable", () => {
   assert.deepEqual(Object.keys(doc.on), ["workflow_call"]);
 });
@@ -116,6 +132,9 @@ test("refuses dispatch-workflow without push-token for any trigger other than pu
           // path writes here, and every case in this test that expects
           // code 0 has to actually reach it.
           GITHUB_OUTPUT: "/dev/null",
+          GH_TOKEN: "fake",
+          GITHUB_REPOSITORY: "test-owner/test-repo",
+          GIT_CONFIG_GLOBAL: NO_NETWORK_GIT_CONFIG,
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -173,6 +192,9 @@ test("a caller with no dispatch-workflow set is never refused on trigger alone, 
       EVENT_NAME: "push",
       HAS_PUSH_TOKEN: "false",
       GITHUB_OUTPUT: "/dev/null",
+      GH_TOKEN: "fake",
+      GITHUB_REPOSITORY: "test-owner/test-repo",
+      GIT_CONFIG_GLOBAL: NO_NETWORK_GIT_CONFIG,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -203,8 +225,13 @@ test("the committed output falls back to 'false' when the commit step never ran"
   // steps.commit.outputs.committed is unset (empty string), not the string
   // 'false', whenever the commit step is skipped (a moved branch, or a
   // failed/missing download) — the documented output contract promises
-  // 'false' there, which only the || fallback delivers.
-  assert.match(doc.jobs.commit.outputs.committed, /steps\.commit\.outputs\.committed \|\| 'false'/);
+  // 'false' there, which only the || fallback delivers. Also falls back
+  // through checkout-guard's own committed output (set when branch-ref
+  // vanished before checkout could even run), ahead of the final 'false'.
+  assert.match(
+    doc.jobs.commit.outputs.committed,
+    /steps\.commit\.outputs\.committed \|\| steps\.checkout-guard\.outputs\.committed \|\| 'false'/,
+  );
 });
 
 test("fails fast, before checkout, when comment-marker or dispatch-workflow is set without pr-number", () => {
@@ -264,6 +291,9 @@ test("fails fast on an empty branch-ref, before checkout can silently fall back"
           EVENT_NAME: "pull_request",
           HAS_PUSH_TOKEN: "false",
           GITHUB_OUTPUT: "/dev/null",
+          GH_TOKEN: "fake",
+          GITHUB_REPOSITORY: "test-owner/test-repo",
+          GIT_CONFIG_GLOBAL: NO_NETWORK_GIT_CONFIG,
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -305,6 +335,9 @@ test("fails fast on an empty artifact-name, before download-artifact can silentl
           EVENT_NAME: "pull_request",
           HAS_PUSH_TOKEN: "false",
           GITHUB_OUTPUT: "/dev/null",
+          GH_TOKEN: "fake",
+          GITHUB_REPOSITORY: "test-owner/test-repo",
+          GIT_CONFIG_GLOBAL: NO_NETWORK_GIT_CONFIG,
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -1034,7 +1067,12 @@ test("the empty-render sentinel is stripped before committing, resulting in an a
 
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
-  assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);
+  // push_url is its own variable now (the graceful-degradation handling
+  // below reuses it for a second, ls-remote call), not inlined into the
+  // git push line itself -- so this checks the definition and the push's
+  // use of it separately rather than one combined regex.
+  assert.match(commit, /push_url="https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);
+  assert.match(commit, /git push --force-with-lease=[^ ]+ "\$push_url"/);
   assert.doesNotMatch(commit, /git push origin/);
 });
 
@@ -1095,6 +1133,21 @@ test("a branch-ref colliding with an existing tag of the same name is rejected, 
     execFileSync("git", ["config", `url.${bareRemote}.insteadOf`, pushUrl], {
       cwd: workspace,
     });
+
+    // Run the real validate-step probe against this exact setup, deriving
+    // BRANCH_EXISTED_AT_START from its actual output rather than asserting
+    // it: refs/heads/release never existed here, only the tag did, so the
+    // probe itself must be the one to say "false" for this test to reach
+    // the never-existed-branch failure rather than the vanished-branch one.
+    const validateStep = step("Validate the input combination");
+    const validateResult = runValidateStep(validateStep, workspace, "release", tagSha);
+    assert.equal(validateResult.code, 0, "the validate step must not fail on a tag-only ref");
+    assert.equal(
+      validateResult.outputs.branch_existed_at_start,
+      "false",
+      "the probe must not see a branch here -- only a tag exists",
+    );
+
     fs.mkdirSync(path.join(workspace, "out", "example"), { recursive: true });
     fs.writeFileSync(path.join(workspace, "out", "example", "real.txt"), "y");
 
@@ -1116,6 +1169,7 @@ test("a branch-ref colliding with an existing tag of the same name is rejected, 
           EXPECTED_HEAD_SHA: tagSha,
           GH_TOKEN: "faketoken",
           GITHUB_REPOSITORY: "test-owner/test-repo",
+          BRANCH_EXISTED_AT_START: validateResult.outputs.branch_existed_at_start,
         },
         stdio: ["ignore", "pipe", "pipe"],
       }).toString();
@@ -1139,6 +1193,669 @@ test("a branch-ref colliding with an existing tag of the same name is rejected, 
         }),
       "refs/heads/release must not have been created either",
     );
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+// Shared scaffolding for the three push-failure-handling regressions below:
+// a bare remote, a workspace cloned from nothing with an initial commit, and
+// the same url.insteadOf redirect the tag-collision regression above uses so
+// the step's own hardcoded github.com push URL reaches a real local remote.
+function setUpPushHarness() {
+  const bareRemote = fs.mkdtempSync(path.join(os.tmpdir(), "commit-pushfail-remote-"));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-pushfail-work-"));
+  const pushUrl = "https://x-access-token:faketoken@github.com/test-owner/test-repo.git";
+  execFileSync("git", ["init", "-q", "--bare", "."], { cwd: bareRemote });
+  execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+  execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+  execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+  fs.mkdirSync(path.join(workspace, "out"), { recursive: true });
+  fs.writeFileSync(path.join(workspace, "out", "README.md"), "hi");
+  execFileSync("git", ["add", "out/README.md"], { cwd: workspace });
+  execFileSync("git", ["commit", "-qm", "init"], { cwd: workspace });
+  const initialSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: workspace })
+    .toString()
+    .trim();
+  execFileSync("git", ["config", `url.${bareRemote}.insteadOf`, pushUrl], { cwd: workspace });
+  return { bareRemote, workspace, pushUrl, initialSha };
+}
+
+// Runs the real "Validate the input combination" step's script (not a
+// hand-typed reproduction of its branch_existed_at_start probe) against the
+// harness above, so a regression test that needs BRANCH_EXISTED_AT_START
+// exercises the actual probe instead of asserting a hand-picked value for
+// it. Codex review: the push-failure regressions below originally hardcoded
+// BRANCH_EXISTED_AT_START via runPushStep's default, so a bug in the probe
+// itself (stops emitting the output, or misidentifies the exact ref) would
+// go uncaught -- production would then treat a since-deleted branch as one
+// that never existed (a hard failure) while every regression stayed green.
+function runValidateStep(validateStep, workspace, branchRef, expectedHeadSha, extraEnv = {}) {
+  const outputFile = path.join(workspace, ".github_output_validate");
+  fs.writeFileSync(outputFile, "");
+  const result = { code: 0, output: "" };
+  try {
+    result.output = execFileSync("bash", ["-c", validateStep.run], {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        ARTIFACT_NAME: "example",
+        BRANCH_REF: branchRef,
+        EXPECTED_HEAD_SHA: expectedHeadSha,
+        PR_NUMBER: "",
+        COMMENT_MARKER: "",
+        DISPATCH_WORKFLOW: "",
+        EVENT_NAME: "pull_request",
+        HAS_PUSH_TOKEN: "true",
+        GH_TOKEN: "faketoken",
+        GITHUB_REPOSITORY: "test-owner/test-repo",
+        GITHUB_OUTPUT: outputFile,
+        ...extraEnv,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
+  } catch (e) {
+    result.code = e.status;
+    result.output = String(e.stdout || "") + String(e.stderr || "");
+  }
+  result.outputs = Object.fromEntries(
+    fs
+      .readFileSync(outputFile, "utf8")
+      .split("\n")
+      .filter((line) => line.includes("="))
+      .map((line) => {
+        const idx = line.indexOf("=");
+        return [line.slice(0, idx), line.slice(idx + 1)];
+      }),
+  );
+  return result;
+}
+
+// Runs the real "Handle a branch-ref that vanished before or during
+// checkout" step's script against the harness above (no working-directory
+// git repo is needed here — unlike runPushStep, this step only queries the
+// remote, it never touches a local checkout).
+function runCheckoutGuardStep(checkoutGuardStep, workspace, branchRef, expectedHeadSha, extraEnv = {}) {
+  const outputFile = path.join(workspace, ".github_output_checkout_guard");
+  fs.writeFileSync(outputFile, "");
+  const result = { code: 0, output: "" };
+  try {
+    result.output = execFileSync("bash", ["-c", checkoutGuardStep.run], {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        BRANCH_REF: branchRef,
+        EXPECTED_HEAD_SHA: expectedHeadSha,
+        GH_TOKEN: "faketoken",
+        GITHUB_REPOSITORY: "test-owner/test-repo",
+        GITHUB_OUTPUT: outputFile,
+        BRANCH_EXISTED_AT_START: "true",
+        ...extraEnv,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
+  } catch (e) {
+    result.code = e.status;
+    result.output = String(e.stdout || "") + String(e.stderr || "");
+  }
+  result.outputs = Object.fromEntries(
+    fs
+      .readFileSync(outputFile, "utf8")
+      .split("\n")
+      .filter((line) => line.includes("="))
+      .map((line) => {
+        const idx = line.indexOf("=");
+        return [line.slice(0, idx), line.slice(idx + 1)];
+      }),
+  );
+  return result;
+}
+
+// Runs the real "Commit and push" step script (not a hand-typed
+// reproduction) against the harness above, staging a real new file so
+// there's always something to commit, and returns its exit code, output,
+// and parsed $GITHUB_OUTPUT.
+function runPushStep(commitStep, workspace, branchRef, expectedHeadSha, extraEnv = {}) {
+  fs.mkdirSync(path.join(workspace, "out", "example"), { recursive: true });
+  fs.writeFileSync(path.join(workspace, "out", "example", "real.txt"), "y");
+  const outputFile = path.join(workspace, ".github_output");
+  fs.writeFileSync(outputFile, "");
+  const result = { code: 0, output: "" };
+  try {
+    result.output = execFileSync("bash", ["-c", commitStep.run], {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        GITHUB_WORKSPACE: workspace,
+        DEST_PATH: "out/example",
+        GIT_LITERAL_PATHSPECS: "1",
+        BRANCH_REF: branchRef,
+        COMMIT_MESSAGE: "m",
+        EXPECTED_HEAD_SHA: expectedHeadSha,
+        GH_TOKEN: "faketoken",
+        GITHUB_REPOSITORY: "test-owner/test-repo",
+        GITHUB_OUTPUT: outputFile,
+        // Defaults to "true" (a real, still-existing branch) -- the
+        // tag-collision regression overrides it to "false", matching what
+        // the validate step's own early read would have found in that
+        // shape.
+        BRANCH_EXISTED_AT_START: "true",
+        ...extraEnv,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }).toString();
+  } catch (e) {
+    result.code = e.status;
+    result.output = String(e.stdout || "") + String(e.stderr || "");
+  }
+  result.outputs = Object.fromEntries(
+    fs
+      .readFileSync(outputFile, "utf8")
+      .split("\n")
+      .filter((line) => line.includes("="))
+      .map((line) => {
+        const idx = line.indexOf("=");
+        return [line.slice(0, idx), line.slice(idx + 1)];
+      }),
+  );
+  return result;
+}
+
+test("a vanished branch-ref degrades the push to a warning, not a job failure", () => {
+  // Ported from a real production case (typelauncher, before this workflow
+  // existed): the PR merges or closes -- GitHub auto-deletes the head
+  // branch -- while this job is still rendering/committing. There is
+  // nothing left to sync at that point; failing the run would be reporting
+  // a problem that isn't one.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    // Run the real validate-step probe WHILE the branch still exists, same
+    // as production does early in the job -- deriving
+    // BRANCH_EXISTED_AT_START from the actual probe output rather than
+    // asserting it, so a bug in the probe itself would surface here.
+    const validateStep = step("Validate the input combination");
+    const validateResult = runValidateStep(validateStep, workspace, "feature", initialSha);
+    assert.equal(validateResult.code, 0, "the validate step must not fail while the branch exists");
+    assert.equal(
+      validateResult.outputs.branch_existed_at_start,
+      "true",
+      "the probe must see the branch while it still exists",
+    );
+
+    // Delete the branch on the remote -- simulating the PR merging/closing
+    // mid-run -- via a real push, not update-ref, so this is exactly what
+    // GitHub's own auto-delete does.
+    execFileSync("git", ["push", "-q", bareRemote, "--delete", "refs/heads/feature"], {
+      cwd: workspace,
+    });
+
+    const commitStep = step("Commit and push");
+    const result = runPushStep(commitStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: validateResult.outputs.branch_existed_at_start,
+    });
+
+    assert.equal(result.code, 0, "a vanished branch must not fail the job");
+    assert.match(result.output, /no longer exists on the remote/);
+    assert.equal(result.outputs.committed, "false");
+    assert.equal(result.outputs.raced, "true", "the freshness comment must be told to defer, not report up-to-date");
+    assert.throws(
+      () =>
+        execFileSync("git", ["show-ref", "--verify", "--quiet", "refs/heads/feature"], {
+          cwd: bareRemote,
+          stdio: ["ignore", "ignore", "ignore"],
+        }),
+      "the deleted branch must not have been recreated",
+    );
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("checkout is continue-on-error, so a branch vanishing there doesn't fail the job before checkout-guard runs", () => {
+  const checkoutStep = step("Check out the branch");
+  assert.equal(checkoutStep.id, "checkout");
+  assert.equal(checkoutStep["continue-on-error"], true);
+});
+
+test("checkout-guard, and every step after checkout, is gated on checkout having actually succeeded", () => {
+  // steps.guard.outputs.skip is unset (not the string 'true') when guard
+  // itself never ran -- '' != 'true' evaluates truthy in Actions
+  // expressions, so without an explicit checkout.outcome term, clear/
+  // download/commit would run against a checkout that never happened.
+  assert.equal(step("Handle a branch-ref that vanished before or during checkout").id, "checkout-guard");
+  assert.equal(
+    step("Handle a branch-ref that vanished before or during checkout").if,
+    "steps.checkout.outcome != 'success'",
+  );
+  assert.match(step("Refuse to act on an untested branch head").if, /steps\.checkout\.outcome == 'success'/);
+  assert.match(step("Empty the destination before extracting the artifact").if, /steps\.checkout\.outcome == 'success'/);
+  assert.match(step("Download the artifact").if, /steps\.checkout\.outcome == 'success'/);
+  assert.match(step("Commit and push").if, /steps\.checkout\.outcome == 'success'/);
+});
+
+test("a branch-ref that vanished before checkout ever ran degrades gracefully, exactly like a post-guard vanish", () => {
+  // Codex review: the graceful vanished-branch handling this workflow
+  // already had (in "Commit and push") only covers the window from the
+  // guard step onward -- a branch deleted between the validate step's
+  // probe and checkout itself (not narrow; the render job triggering this
+  // one can run for minutes first) made checkout fail outright, well
+  // before any of that handling could run.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+    execFileSync("git", ["push", "-q", bareRemote, "--delete", "refs/heads/feature"], {
+      cwd: workspace,
+    });
+
+    const checkoutGuardStep = step("Handle a branch-ref that vanished before or during checkout");
+    const result = runCheckoutGuardStep(checkoutGuardStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: "true",
+    });
+
+    assert.equal(result.code, 0, "a vanished branch-ref must not fail the job here either");
+    assert.match(result.output, /no longer exists on the remote/);
+    assert.equal(result.outputs.committed, "false");
+    assert.equal(result.outputs.commit_sha, initialSha);
+    assert.equal(result.outputs.raced, "true");
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("the validate step's probe captures the SHA it actually saw, not just true/false", () => {
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    const validateStep = step("Validate the input combination");
+    const result = runValidateStep(validateStep, workspace, "feature", initialSha);
+
+    assert.equal(result.outputs.branch_existed_at_start, "true");
+    assert.equal(result.outputs.branch_sha_at_start, initialSha);
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a branch-ref that advanced past expected-head-sha, then vanished before checkout, reports the SHA the validate probe actually saw — not the by-then-stale expected-head-sha", () => {
+  // Codex review: a compound race on top of the one the previous test
+  // covers. The validate step's probe can itself observe branch-ref
+  // already past expected-head-sha (a legitimate push landed between this
+  // run's trigger and its own validate step) — if branch-ref THEN vanishes
+  // before checkout runs, checkout-guard's own re-probe finds nothing and
+  // has nothing left to observe itself. Falling back to expected-head-sha
+  // (a workflow INPUT, stale by the time this run even started) would
+  // violate commit-sha's documented "last head this run actually observed"
+  // contract; the validate step's own earlier observation is what's true.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    // A second, independent clone advances the branch past initialSha —
+    // this run's validate step will observe THIS new head, not initialSha.
+    const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), "commit-validate-advance-"));
+    let advancedSha;
+    try {
+      execFileSync("git", ["clone", "-q", bareRemote, "."], { cwd: otherClone });
+      execFileSync("git", ["checkout", "-q", "feature"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.email", "racer@example.com"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.name", "racer"], { cwd: otherClone });
+      fs.writeFileSync(path.join(otherClone, "out", "README.md"), "advanced");
+      execFileSync("git", ["commit", "-aqm", "advanced before validate ran"], { cwd: otherClone });
+      execFileSync("git", ["push", "-q", "origin", "feature"], { cwd: otherClone });
+      advancedSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: otherClone }).toString().trim();
+    } finally {
+      fs.rmSync(otherClone, { recursive: true, force: true });
+    }
+    assert.notEqual(advancedSha, initialSha, "the race setup must actually have moved the branch");
+
+    const validateStep = step("Validate the input combination");
+    const validateResult = runValidateStep(validateStep, workspace, "feature", initialSha);
+    assert.equal(validateResult.outputs.branch_existed_at_start, "true");
+    assert.equal(validateResult.outputs.branch_sha_at_start, advancedSha);
+
+    // Now branch-ref vanishes before checkout ever gets a chance to run.
+    execFileSync("git", ["push", "-q", bareRemote, "--delete", "refs/heads/feature"], {
+      cwd: workspace,
+    });
+
+    const checkoutGuardStep = step("Handle a branch-ref that vanished before or during checkout");
+    const result = runCheckoutGuardStep(checkoutGuardStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: validateResult.outputs.branch_existed_at_start,
+      BRANCH_SHA_AT_START: validateResult.outputs.branch_sha_at_start,
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(
+      result.outputs.commit_sha,
+      advancedSha,
+      "must report the SHA the validate probe actually observed, not the stale expected-head-sha input",
+    );
+    assert.notEqual(result.outputs.commit_sha, initialSha);
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("checkout failing for a reason OTHER than the branch vanishing (it still exists) still fails the job loudly", () => {
+  // The negative case: checkout can fail for reasons that have nothing to
+  // do with branch-ref vanishing (auth, a transient network blip) while
+  // the branch itself is still right there on the remote -- must not be
+  // waved through as a benign deletion just because checkout itself failed.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    const checkoutGuardStep = step("Handle a branch-ref that vanished before or during checkout");
+    const result = runCheckoutGuardStep(checkoutGuardStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: "true",
+    });
+
+    assert.notEqual(result.code, 0, "checkout failing while the branch still exists must be a real failure");
+    assert.match(result.output, /reason other than the branch vanishing/);
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("checkout failing on a branch-ref that never existed (only ever a tag) fails loudly, not the vanished-branch wording", () => {
+  const { workspace, initialSha } = setUpPushHarness();
+  try {
+    const checkoutGuardStep = step("Handle a branch-ref that vanished before or during checkout");
+    const result = runCheckoutGuardStep(checkoutGuardStep, workspace, "never-a-branch", initialSha, {
+      BRANCH_EXISTED_AT_START: "false",
+    });
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.output, /did not exist at the start of this run either/);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("checkout failing with an inconclusive validate probe (unknown) reports honestly, not the tag-only wording", () => {
+  const { workspace, initialSha } = setUpPushHarness();
+  try {
+    const checkoutGuardStep = step("Handle a branch-ref that vanished before or during checkout");
+    const result = runCheckoutGuardStep(checkoutGuardStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: "unknown",
+    });
+
+    assert.notEqual(result.code, 0);
+    assert.match(result.output, /could not confirm whether it existed/);
+    assert.doesNotMatch(result.output, /did not exist at the start of this run either/);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("the validate step's probe reports 'unknown', not 'false', when it can't even query the remote", () => {
+  // Codex review: collapsing a failed ls-remote (transport/auth) into the
+  // same 'false' a genuine not-found produces means a branch that later
+  // really does vanish gets diagnosed with "did not exist at the start
+  // either" even though this step never actually confirmed that. A `git`
+  // wrapper on PATH that fails only `ls-remote` (passing every other git
+  // subcommand through to the real binary) reproduces a query that
+  // genuinely cannot run, as opposed to one that runs and finds nothing.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "commit-validate-fakegit-"));
+  try {
+    const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+    const wrapperPath = path.join(fakeBin, "git");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\nif [ "$1" = "ls-remote" ]; then\n  echo "fatal: simulated transport failure" >&2\n  exit 128\nfi\nexec "${realGit}" "$@"\n`,
+    );
+    fs.chmodSync(wrapperPath, 0o755);
+
+    const validateStep = step("Validate the input combination");
+    const result = runValidateStep(validateStep, workspace, "feature", initialSha, {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+    });
+
+    assert.equal(result.code, 0, "a probe failure must not fail the validate step itself");
+    assert.match(result.output, /could not query.*unconfirmed/s);
+    assert.equal(result.outputs.branch_existed_at_start, "unknown");
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("a branch that later genuinely vanishes, after an inconclusive probe, still fails loudly -- with an honest message, not the tag-collision wording", () => {
+  // The negative case for the 'unknown' probe state above: the commit step
+  // must still hard-fail here (this workflow's fail-closed default -- never
+  // silently swallow a disappearance the validate step couldn't rule out),
+  // but the message must not claim "did not exist at the start either",
+  // since BRANCH_EXISTED_AT_START=unknown means this never actually checked
+  // that -- it would be indistinguishable from a real branch that vanished
+  // right after an auth hiccup in the validate step.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+    execFileSync("git", ["push", "-q", bareRemote, "--delete", "refs/heads/feature"], {
+      cwd: workspace,
+    });
+
+    const commitStep = step("Commit and push");
+    const result = runPushStep(commitStep, workspace, "feature", initialSha, {
+      BRANCH_EXISTED_AT_START: "unknown",
+    });
+
+    assert.notEqual(result.code, 0, "an unconfirmed-then-vanished branch must still fail the job");
+    assert.match(result.output, /could not confirm whether it existed/);
+    assert.doesNotMatch(
+      result.output,
+      /did not exist at the start of this run either/,
+      "must not claim it verified something it never actually checked",
+    );
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a branch-ref that advanced past expected-head-sha degrades the push to a warning (a lost race), not a job failure", () => {
+  // A concurrent push to branch-ref between the guard step observing it and
+  // this step reaching the push -- this workflow's own guard step can't see
+  // it, but the lease will. Whatever run produced that newer head is
+  // responsible for its own sync; this run has nothing current left to add.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    // A second, independent clone races in a real commit of its own.
+    const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), "commit-pushfail-racer-"));
+    try {
+      execFileSync("git", ["clone", "-q", bareRemote, "."], { cwd: otherClone });
+      execFileSync("git", ["checkout", "-q", "feature"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.email", "racer@example.com"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.name", "racer"], { cwd: otherClone });
+      fs.writeFileSync(path.join(otherClone, "out", "README.md"), "raced");
+      execFileSync("git", ["commit", "-aqm", "concurrent update"], { cwd: otherClone });
+      execFileSync("git", ["push", "-q", "origin", "feature"], { cwd: otherClone });
+    } finally {
+      fs.rmSync(otherClone, { recursive: true, force: true });
+    }
+    const racedSha = execFileSync("git", ["ls-remote", bareRemote, "refs/heads/feature"], {})
+      .toString()
+      .split(/\s+/)[0];
+    assert.notEqual(racedSha, initialSha, "the race setup must actually have moved the branch");
+
+    const commitStep = step("Commit and push");
+    // Still using the STALE initialSha -- what this run's own guard step
+    // observed before the race landed.
+    const result = runPushStep(commitStep, workspace, "feature", initialSha);
+
+    assert.equal(result.code, 0, "a lost race must not fail the job");
+    assert.match(result.output, /advanced past/);
+    assert.equal(result.outputs.committed, "false");
+    assert.equal(result.outputs.raced, "true", "the freshness comment must be told to defer, not report up-to-date");
+    // Codex review: the reported commit_sha must be the racing commit that
+    // is actually branch-ref's head now, not the stale initialSha this
+    // run's own guard step observed before the race -- the documented
+    // output contract promises the CURRENT head when nothing was pushed.
+    assert.equal(result.outputs.commit_sha, racedSha);
+    const shaAfter = execFileSync("git", ["ls-remote", bareRemote, "refs/heads/feature"], {})
+      .toString()
+      .split(/\s+/)[0];
+    assert.equal(shaAfter, racedSha, "the racing commit must survive untouched, not be overwritten");
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("an unrelated branch whose name ends in refs/heads/$BRANCH_REF does not corrupt the diagnosis", () => {
+  // Codex review: `git ls-remote <url> refs/heads/feature` matches as a
+  // SUFFIX pattern, not an exact ref name -- verified directly, a real
+  // branch named "a/refs/heads/feature" is returned right alongside the
+  // real "refs/heads/feature" for that same query. Naively taking the
+  // first returned line's SHA can therefore pick up a completely
+  // unrelated branch's commit instead of the one this run actually cares
+  // about, potentially misclassifying a real failure as a benign one (or
+  // vice versa). This reproduces exactly that collision and asserts the
+  // diagnosis still lands on the real branch, not the decoy.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+    // A decoy branch whose name happens to end in "refs/heads/feature" --
+    // git allows slashes in branch names, so this is a legal ref.
+    execFileSync(
+      "git",
+      ["push", "-q", bareRemote, "HEAD:refs/heads/decoy/refs/heads/feature"],
+      { cwd: workspace },
+    );
+    const decoySha = execFileSync(
+      "git",
+      ["ls-remote", bareRemote, "refs/heads/decoy/refs/heads/feature"],
+      {},
+    )
+      .toString()
+      .split(/\s+/)[0];
+
+    // Race a real commit onto the REAL "feature" branch, same as the lost-
+    // race test above -- the decoy is a distractor, not the thing racing.
+    const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), "commit-pushfail-decoy-racer-"));
+    let racedSha;
+    try {
+      execFileSync("git", ["clone", "-q", bareRemote, "."], { cwd: otherClone });
+      execFileSync("git", ["checkout", "-q", "feature"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.email", "racer@example.com"], { cwd: otherClone });
+      execFileSync("git", ["config", "user.name", "racer"], { cwd: otherClone });
+      fs.writeFileSync(path.join(otherClone, "out", "README.md"), "raced");
+      execFileSync("git", ["commit", "-aqm", "concurrent update"], { cwd: otherClone });
+      execFileSync("git", ["push", "-q", "origin", "feature"], { cwd: otherClone });
+      racedSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: otherClone }).toString().trim();
+    } finally {
+      fs.rmSync(otherClone, { recursive: true, force: true });
+    }
+    assert.notEqual(racedSha, decoySha, "the decoy and the real race must land on different commits, or this test proves nothing");
+
+    const commitStep = step("Commit and push");
+    const result = runPushStep(commitStep, workspace, "feature", initialSha);
+
+    assert.equal(result.code, 0, "a lost race must not fail the job even with a colliding decoy ref present");
+    assert.equal(result.outputs.committed, "false");
+    // The load-bearing assertion: the reported SHA must be the REAL
+    // branch's race winner, never the decoy's.
+    assert.equal(result.outputs.commit_sha, racedSha);
+    assert.notEqual(result.outputs.commit_sha, decoySha);
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a push that actually landed is reported as committed, even though git push itself exited nonzero", () => {
+  // Codex review: a dropped connection after GitHub accepts the ref update
+  // but before the client reads the response makes `git push` exit nonzero
+  // for a push that in fact succeeded.
+  //
+  // First attempt at reproducing this pre-landed the exact commit the
+  // script would build (same parent/tree/message/identity/timestamps) onto
+  // branch-ref before the script ran, expecting its force-with-lease to
+  // reject since the remote had "moved" past EXPECTED_HEAD_SHA. It didn't:
+  // git's own push short-circuits to "Everything up-to-date" (exit 0, no
+  // network round-trip at all) whenever the local HEAD already equals the
+  // remote's current state, regardless of the lease's expected OLD value --
+  // verified directly. That's a different, already-handled shape (the
+  // ordinary success path), not Codex's scenario: there, the client
+  // genuinely doesn't get a response and reports failure even though the
+  // server applied the update.
+  //
+  // Reproduced properly with a `git` wrapper on PATH: it lets `git push`
+  // actually run for real (so the remote is genuinely mutated), then
+  // deliberately reports failure regardless of the real outcome -- exactly
+  // "the server accepted it, the client didn't find out." Every other git
+  // invocation passes straight through to the real binary.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "commit-pushfail-fakegit-"));
+  try {
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+
+    const realGit = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+    const wrapperPath = path.join(fakeBin, "git");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\nif [ "$1" = "push" ]; then\n  "${realGit}" "$@"\n  code=$?\n  if [ "$code" -eq 0 ]; then\n    exit 1\n  fi\n  exit "$code"\nfi\nexec "${realGit}" "$@"\n`,
+    );
+    fs.chmodSync(wrapperPath, 0o755);
+
+    const commitStep = step("Commit and push");
+    const result = runPushStep(commitStep, workspace, "feature", initialSha, {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+    });
+
+    const pushedSha = execFileSync("git", ["ls-remote", bareRemote, "refs/heads/feature"], {})
+      .toString()
+      .split(/\s+/)[0];
+    assert.notEqual(pushedSha, initialSha, "the wrapped push must have actually mutated the remote");
+    assert.equal(result.code, 0, "an already-landed push must not fail the job");
+    assert.match(result.output, /already reports this run's own new commit/);
+    assert.equal(result.outputs.committed, "true");
+    assert.equal(result.outputs.commit_sha, pushedSha);
+  } finally {
+    fs.rmSync(bareRemote, { recursive: true, force: true });
+    fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(fakeBin, { recursive: true, force: true });
+  }
+});
+
+test("a push rejected for a reason other than a vanished or moved branch still fails the job loudly", () => {
+  // The negative case for both regressions above: when the remote still
+  // reports branch-ref at exactly expected-head-sha (no deletion, no race)
+  // and the push is STILL rejected -- a branch-protection rule or similar
+  // -- this is a real failure of the sync mechanism itself and must not be
+  // swallowed as though it were one of the benign cases. A pre-receive
+  // hook that rejects unconditionally reproduces that without needing a
+  // real GitHub branch-protection rule: git ls-remote doesn't invoke
+  // server-side hooks, so it still reports the true, unchanged ref.
+  const { bareRemote, workspace, initialSha } = setUpPushHarness();
+  try {
+    // A plain push, before the hook exists, to seed the branch -- so only
+    // the actual test push below hits the hook.
+    execFileSync("git", ["push", "-q", bareRemote, "HEAD:refs/heads/feature"], { cwd: workspace });
+    const hookPath = path.join(bareRemote, "hooks", "pre-receive");
+    fs.writeFileSync(hookPath, '#!/bin/sh\necho "rejected by policy" >&2\nexit 1\n');
+    fs.chmodSync(hookPath, 0o755);
+
+    const commitStep = step("Commit and push");
+    const result = runPushStep(commitStep, workspace, "feature", initialSha);
+
+    assert.equal(result.code, 1, "a genuinely rejected push must fail the job");
+    assert.doesNotMatch(result.output, /no longer exists on the remote/);
+    assert.doesNotMatch(result.output, /advanced past/);
+    assert.match(result.output, /real failure/);
   } finally {
     fs.rmSync(bareRemote, { recursive: true, force: true });
     fs.rmSync(workspace, { recursive: true, force: true });
@@ -1346,6 +2063,49 @@ test("a SKIPPED (branch-moved) run posts nothing at all, rather than risking a s
   assert.match(branch, /\breturn;/, "the SKIPPED branch must return without posting a comment");
   assert.ok(!branch.includes("pulls.get"), "the SKIPPED branch must not perform (or depend on) the live-head re-check");
   assert.ok(!branch.includes("status ="), "the SKIPPED branch must not build a status message to post");
+});
+
+test("a post-guard race (branch vanished or advanced during the push itself) also posts nothing, not an up-to-date report", () => {
+  // Codex review: the commit step's own graceful-degradation handling
+  // (vanished branch-ref, or a race lost between the guard step and the
+  // actual push) reports committed=false -- accurate, but indistinguishable
+  // from "genuinely nothing to commit" without the RACED signal this step
+  // also sets in exactly those two cases. Without checking it, this branch
+  // would report "up-to-date" for a run that in fact deferred to someone
+  // else's newer state -- the same overwrite risk the guard-stage SKIPPED
+  // branch above already guards against, just one step later.
+  const script = step("Comment freshness on the PR").with.script;
+  const branch = freshnessBranch(script, "process.env.RACED === 'true'", "} else {");
+  assert.match(branch, /\breturn;/, "the RACED branch must return without posting a comment");
+  assert.ok(!branch.includes("pulls.get"), "the RACED branch must not perform (or depend on) the live-head re-check");
+  assert.ok(!branch.includes("status ="), "the RACED branch must not build a status message to post");
+  // Checked strictly after COMMITTED === 'true', not before it: a run that
+  // both raced AND still has committed=='true' (the already-landed-push
+  // case, which never sets raced) must still report as regenerated. Fully
+  // qualified with the process.env. prefix, not a bare "RACED === 'true'"
+  // substring search — CHECKOUT_GUARD_RACED === 'true' (a distinct,
+  // earlier check) also contains that bare substring and would otherwise
+  // be found instead of this (the post-guard) occurrence.
+  const committedIdx = script.indexOf("process.env.COMMITTED === 'true'");
+  const racedIdx = script.indexOf("process.env.RACED === 'true'");
+  assert.ok(committedIdx > -1 && committedIdx < racedIdx, "COMMITTED === 'true' must be checked before RACED");
+});
+
+test("the commit step signals RACED only for the two branch-moved degradations, not for a genuine no-change run", () => {
+  const commitStep = step("Commit and push");
+  // The two graceful-degradation branches (vanished, advanced-past-expected)
+  // both set raced=true; the plain "git diff --cached --quiet" no-change
+  // exit earlier in the same script must not.
+  const racedCount = (commitStep.run.match(/raced=true/g) || []).length;
+  assert.equal(racedCount, 2, "expected exactly the vanished-branch and lost-race branches to set raced=true");
+  const noChangeIdx = commitStep.run.indexOf("No changes under");
+  const firstRacedIdx = commitStep.run.indexOf("raced=true");
+  assert.ok(noChangeIdx > -1 && noChangeIdx < firstRacedIdx, "the no-change exit must come before either raced=true write");
+  assert.doesNotMatch(
+    commitStep.run.slice(noChangeIdx, commitStep.run.indexOf("git commit -q -m")),
+    /raced=true/,
+    "the no-change branch itself must not set raced=true",
+  );
 });
 
 test("checkout/guard/clear failing before the download step is checked reports distinctly, first in the chain", () => {
