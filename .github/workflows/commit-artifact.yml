@@ -21,8 +21,14 @@ on:
           exist: this job fails if it can't be downloaded, rather than
           silently skipping. actions/upload-artifact can't represent a
           genuinely empty render as a real artifact, so if yours can
-          legitimately produce zero files, upload a placeholder for that
-          case instead of relying on if-no-files-found: ignore.
+          legitimately produce zero files, upload a single file named
+          '.ci-commit-artifact-empty' (any content) as the artifact's
+          whole content, instead of relying on if-no-files-found: ignore.
+          This workflow strips that exact reserved filename after
+          download, before committing anything, so dest-path ends up
+          genuinely empty and the run commits as an all-deletions result —
+          a caller-chosen placeholder would instead be committed as real
+          content, which defeats the point.
         required: true
         type: string
       dest-path:
@@ -434,11 +440,14 @@ jobs:
         # artifact and a genuinely empty render are indistinguishable from
         # here (actions/upload-artifact cannot represent "zero files" as a
         # real artifact at all, so a caller whose render can legitimately
-        # produce nothing must still upload a placeholder for that case), but
-        # guessing wrong in either direction is worse than asking: treating a
-        # missing artifact as "nothing to do" would silently drop a real
-        # deletion (dest-path was already emptied above, so the loss would be
-        # invisible until someone noticed stale content never went away);
+        # produce nothing must upload the reserved '.ci-commit-artifact-empty'
+        # sentinel for that case — see artifact-name's description and the
+        # "Commit and push" step, which strips it before committing
+        # anything), but guessing wrong in either direction is worse than
+        # asking: treating a missing artifact as "nothing to do" would
+        # silently drop a real deletion (dest-path was already emptied
+        # above, so the loss would be invisible until someone noticed stale
+        # content never went away);
         # treating it as fatal at least says so, on the exact run where it
         # happened, with GitHub's own "artifact not found" error attached.
 
@@ -532,6 +541,24 @@ jobs:
           # without needing "missing" to exist — verified directly with
           # this exact shape before adding it here.
           resolved_dest=$(realpath -m -- "$GITHUB_WORKSPACE/$DEST_PATH")
+          # Codex review: the artifact-name input's own advice ("upload a
+          # placeholder" for a render that can legitimately produce zero
+          # files) was incomplete -- a caller who followed it literally
+          # would have that placeholder file extracted and then COMMITTED
+          # by git add -f -A below, which is the opposite of the "commit an
+          # all-deletions, genuinely-empty result" the advice was meant to
+          # enable. This is the workflow's own end of that contract: a
+          # top-level file with this exact reserved name is the sentinel
+          # for "the render legitimately produced nothing," and gets
+          # stripped here, before it can ever reach git add. Top-level
+          # only (not a recursive find) -- the sentinel is documented as
+          # the artifact's whole content, so it lands at dest-path's own
+          # root once download-artifact extracts it, same as any
+          # single-file artifact would.
+          empty_sentinel="$resolved_dest/.ci-commit-artifact-empty"
+          if [ -f "$empty_sentinel" ]; then
+            rm -f -- "$empty_sentinel"
+          fi
           git_entries=$(find "$resolved_dest" -name .git)
           if [ -n "$git_entries" ]; then
             echo "::error::the artifact contains .git entries under $DEST_PATH, which git add -f silently skips rather than staging or erroring on:"
