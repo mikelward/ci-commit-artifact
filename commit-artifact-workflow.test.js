@@ -940,6 +940,98 @@ test("refuses to commit when the index has a stale submodule (gitlink) entry und
   assert.doesNotMatch(clean.output, /stale submodule \(gitlink\) entry/);
 });
 
+test("the empty-render sentinel is stripped before committing, resulting in an all-deletions commit rather than a committed placeholder", () => {
+  // Codex review: the artifact-name input's own advice for a render that
+  // can legitimately produce zero files ("upload a placeholder") was
+  // incomplete -- actions/download-artifact would extract that placeholder
+  // under dest-path same as any real content, and git add -f -A below
+  // would then COMMIT it, which is the opposite of the "genuinely empty,
+  // all-deletions" result the advice was meant to enable. This is the
+  // workflow's own end of that contract: a reserved sentinel filename gets
+  // stripped before it can ever reach git add, so the destination is
+  // really empty and any previously-tracked content under it is deleted,
+  // nothing new staged in its place.
+  const commitStep = step("Commit and push");
+  assert.match(commitStep.run, /\.ci-commit-artifact-empty/);
+  const sentinelIdx = commitStep.run.indexOf("empty_sentinel=");
+  const gitAddIdx = commitStep.run.lastIndexOf('git add -f -A -- "$DEST_PATH"');
+  assert.ok(sentinelIdx > -1 && sentinelIdx < gitAddIdx, "the sentinel must be stripped before git add");
+
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "commit-emptysentinel-"));
+  try {
+    execFileSync("git", ["init", "-q", "."], { cwd: workspace });
+    execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: workspace });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: workspace });
+    fs.mkdirSync(path.join(workspace, "out"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "out", "README.md"), "hi");
+    // Previously-generated content under dest-path from an earlier run --
+    // this run's render legitimately produced nothing, so it should be
+    // deleted, not left behind.
+    fs.mkdirSync(path.join(workspace, "out", "example"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "out", "example", "real.txt"), "old content");
+    execFileSync("git", ["add", "out/README.md", "out/example/real.txt"], { cwd: workspace });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: workspace });
+
+    // Simulate the "Empty the destination" + "Download the artifact" steps
+    // for a caller-uploaded empty-render sentinel: dest-path is cleared,
+    // then re-populated with only the reserved sentinel file, exactly what
+    // download-artifact would produce for a single-file artifact.
+    fs.rmSync(path.join(workspace, "out", "example"), { recursive: true, force: true });
+    fs.mkdirSync(path.join(workspace, "out", "example"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "out", "example", ".ci-commit-artifact-empty"), "");
+
+    try {
+      execFileSync("bash", ["-c", commitStep.run], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          GITHUB_WORKSPACE: workspace,
+          DEST_PATH: "out/example",
+          GIT_LITERAL_PATHSPECS: "1",
+          BRANCH_REF: "x",
+          COMMIT_MESSAGE: "m",
+          EXPECTED_HEAD_SHA: "a".repeat(40),
+          GH_TOKEN: "fake",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      // The push itself fails for unrelated reasons in this sandboxed test
+      // (no real github.com to push to) -- same posture as the gitlink
+      // "clean" regression above. What matters happened locally before
+      // that: the sentinel's removal and the commit it enabled.
+    }
+
+    assert.ok(
+      !fs.existsSync(path.join(workspace, "out", "example", ".ci-commit-artifact-empty")),
+      "the sentinel file must not survive on disk",
+    );
+    const committedFiles = execFileSync("git", ["show", "--stat", "--format=", "HEAD"], {
+      cwd: workspace,
+    }).toString();
+    assert.doesNotMatch(
+      committedFiles,
+      /\.ci-commit-artifact-empty/,
+      "the sentinel must never appear in a real commit",
+    );
+    assert.match(
+      committedFiles,
+      /real\.txt/,
+      "the previously-generated file's deletion must be part of the commit",
+    );
+    const stillTracked = execFileSync("git", ["ls-tree", "-r", "--name-only", "HEAD"], {
+      cwd: workspace,
+    }).toString();
+    assert.doesNotMatch(
+      stillTracked,
+      /out\/example/,
+      "dest-path must end up genuinely empty in the resulting commit, not holding the sentinel",
+    );
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test("the git push authenticates via an explicit token URL, not the origin remote name", () => {
   const commit = step("Commit and push").run;
   assert.match(commit, /git push --force-with-lease=[^ ]+ "https:\/\/x-access-token:\$\{GH_TOKEN\}@github\.com/);
