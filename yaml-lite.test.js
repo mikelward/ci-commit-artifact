@@ -830,3 +830,106 @@ test("round-trips this repository's own commit-artifact.yml without throwing", (
   assert.ok(Array.isArray(doc.jobs.commit.steps), "jobs.commit.steps should be an array");
   assert.ok(doc.jobs.commit.steps.length >= 5, "expected at least 5 steps");
 });
+
+test("throws on a sequence entry in value position, rather than fabricating a literal string", () => {
+  // Synced from mikelward/yaml-lite#2. Four shapes all previously fell
+  // through to the plain-scalar return and came back as the literal text
+  // ("- x"), each verified against yaml.safe_load:
+  //   "a:\n  - - x\n" => {'a': [['x']]}   — real YAML, a nested sequence,
+  //     out of this parser's scope, so it must throw rather than return
+  //     the fabricated string "- x";
+  //   "- - a\n"       => [['a']]          — same;
+  //   "a: - b\n"      raises "sequence entries are not allowed here";
+  //   "a: [- b]\n"    raises "while parsing a flow node".
+  for (const input of ["a:\n  - - x\n", "- - a\n", "a: - b\n", "a: [- b]\n"]) {
+    assert.throws(
+      () => parseWorkflowYaml(input),
+      /sequence entry in value position/,
+      `expected a throw for ${JSON.stringify(input)}`,
+    );
+  }
+  // A bare "-" in value position is the same indicator with no content:
+  // yaml.safe_load("a: -\n") raises "sequence entries are not allowed
+  // here" too.
+  assert.throws(() => parseWorkflowYaml("a: -\n"), /sequence entry in value position/);
+});
+
+test("does not false-positive on dashes that are legitimate plain-scalar content", () => {
+  // ns-plain-first permits "-" when followed by a non-space character, so
+  // negative numbers and dash-prefixed words stay values, and a QUOTED
+  // "- b" is ordinary content — all verified against yaml.safe_load.
+  assert.deepEqual(parseWorkflowYaml("a: -1\n"), { a: -1 });
+  assert.deepEqual(parseWorkflowYaml("a: -x\n"), { a: "-x" });
+  assert.deepEqual(parseWorkflowYaml("list:\n  - -1\n"), { list: [-1] });
+  assert.deepEqual(parseWorkflowYaml('a: "- b"\n'), { a: "- b" });
+});
+
+
+test("a bare dash is a valid flow-sequence element, but dash-then-space is not", () => {
+  // Synced from mikelward/yaml-lite#2 (Codex review of the rejection's
+  // first version): a bare "-" is a real string element in flow context,
+  // because there the dash is followed by "]" or ",", not whitespace.
+  // Verified against yaml.safe_load: "a: [-]" => {'a': ['-']};
+  // "a: [-, x]" => {'a': ['-', 'x']}; 'a: ["a", -]' => {'a': ['a', '-']}
+  // — while "a: [ - ]", "a: [x, - ]" (dash followed by a space) and
+  // "a: [- b]" all raise. The block-value cases ("a: -", "a: - b") keep
+  // throwing.
+  assert.deepEqual(parseWorkflowYaml("a: [-]\n"), { a: ["-"] });
+  assert.deepEqual(parseWorkflowYaml("a: [-, x]\n"), { a: ["-", "x"] });
+  assert.deepEqual(parseWorkflowYaml('a: ["a", -]\n'), { a: ["a", "-"] });
+  for (const input of ["a: [ - ]\n", "a: [x, - ]\n", "a: [- b]\n"]) {
+    assert.throws(
+      () => parseWorkflowYaml(input),
+      /sequence entry in value position/,
+      `expected a throw for ${JSON.stringify(input)}`,
+    );
+  }
+});
+
+test("parses a block-scalar header carrying an inline comment", () => {
+  // Synced from mikelward/yaml-lite#2. Real YAML GitHub accepts: the
+  // comment sits after the header, outside the scalar's own content.
+  // Verified against yaml.safe_load:
+  //   "a: | # c\n  x\n"  => {'a': 'x\n'}
+  //   "a: |- # c\n  x\n" => {'a': 'x'}
+  //   "a: | # c\n"       => {'a': ''}
+  // Previously the raw rest "| # c" missed the header match, so the value
+  // parsed as the plain scalar "|" (empty body) or died on the indented
+  // body line as an unsupported construct.
+  assert.deepEqual(parseWorkflowYaml("a: | # c\n  x\n"), { a: "x\n" });
+  assert.deepEqual(parseWorkflowYaml("a: |- # c\n  x\n"), { a: "x" });
+  assert.deepEqual(parseWorkflowYaml("a: | # c\n"), { a: "" });
+  // Multiple spaces before the comment, and a tab INSIDE the comment, are
+  // both fine — yaml.safe_load("a: |  # c\n  x\n") and
+  // ("a: | #\tc\n  x\n") are {'a': 'x\n'}.
+  assert.deepEqual(parseWorkflowYaml("a: |  # c\n  x\n"), { a: "x\n" });
+  assert.deepEqual(parseWorkflowYaml("a: | #\tc\n  x\n"), { a: "x\n" });
+});
+
+test("throws on a block-scalar header that isn't the supported space-separated form", () => {
+  // Synced from mikelward/yaml-lite#2 (Codex review of the commented-
+  // header fix's first version, which stripped the comment with
+  // stripInlineComment before matching and so accepted a TAB-separated
+  // comment — yaml.safe_load raises "while scanning a block scalar" for
+  // "a: |\t# c\n  x\n": the separation before a header comment must be
+  // spaces). The same scan rejects any other trailing junk ("a: |x",
+  // unquoted "a: >=1.2"), while a valid indentation indicator
+  // ("a: |2\n    x\n" => {'a': '  x\n'}) is real YAML this parser
+  // deliberately doesn't implement. All previously fell through to
+  // parseScalar and came back as literal strings; all must throw.
+  for (const input of [
+    "a: |\t# c\n  x\n",
+    "a: |\t# c\n",
+    "a: |x\n",
+    "a: >=1.2\n",
+    "a: |#c\n  x\n",
+    "a: |2\n    x\n",
+    "a: >2- # c\n  x\n",
+  ]) {
+    assert.throws(
+      () => parseWorkflowYaml(input),
+      /unsupported or malformed block scalar header/,
+      `expected a throw for ${JSON.stringify(input)}`,
+    );
+  }
+});
