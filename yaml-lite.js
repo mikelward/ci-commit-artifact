@@ -7,7 +7,8 @@
 // something wrong.
 //
 // Vendored from mikelward/yaml-lite (canonical source; last synced from
-// mikelward/yaml-lite#1, its indentation-tab and NBSP-whitespace fixes).
+// mikelward/yaml-lite#2, its value-position sequence-entry rejection and
+// commented block-scalar header fixes).
 // This parser originated in THIS repository, was copied "verbatim" into
 // mikelward/npm-update, and the two copies then drifted independently for a
 // while before being reconciled into mikelward/yaml-lite, which is now the
@@ -304,9 +305,41 @@ function parseWorkflowYaml(text) {
       if (!hasBalancedFlowBrackets(s)) {
         throw new Error(`yaml-lite: unbalanced flow sequence brackets (got ${JSON.stringify(s)})`);
       }
-      const inner = s.slice(1, -1).trim();
-      if (inner === "") return [];
-      return splitFlowSequence(inner).map(parseScalar);
+      // NOT trimmed before splitting: splitFlowSequence hands each element
+      // back with its raw spacing, and the bare-dash test below needs the
+      // byte after the dash — an outer trim would collapse "[ - ]" (dash
+      // followed by a space — invalid) into "[-]" (valid) before anything
+      // could tell them apart. Elements are trimmed inside parseScalar,
+      // exactly as before.
+      const inner = s.slice(1, -1);
+      if (inner.trim() === "") return [];
+      return splitFlowSequence(inner).map((el) => {
+        // A bare "-" IS a valid flow element — "[-]", "[-, x]" and
+        // '["a", -]' are {'a': ['-']}-shaped in yaml.safe_load, because
+        // the dash there is followed by "]" or "," rather than
+        // whitespace. Only LEADING whitespace is stripped before the
+        // test, so "[ - ]" and "[x, - ]" leave "- " — dash followed by a
+        // space, the block-entry indicator shape, which genuinely raises
+        // in yaml.safe_load — and fall through to parseScalar's
+        // sequence-entry rejection below. Codex review: parseScalar's
+        // context-free guard alone threw on the valid bare forms too.
+        const t = el.replace(/^[ \t]+/, "");
+        if (t === "-") return "-";
+        return parseScalar(el);
+      });
+    }
+    // A plain scalar can't BEGIN with "-" followed by whitespace, or be a
+    // bare "-": that's YAML's block sequence entry indicator (ns-plain-first
+    // permits "-" only when followed by a non-space character, so "-1" and
+    // "-x" stay plain scalars). Where this is reachable it's either a
+    // nested sequence — "- - a" is real YAML meaning [['a']], verified
+    // against yaml.safe_load, but out of this parser's scope — or invalid
+    // outright: yaml.safe_load raises "sequence entries are not allowed
+    // here" for "a: - b" and "a: -", and "while parsing a flow node" for
+    // "a: [- b]". The previous fall-through silently fabricated a literal
+    // string ("- a") for every one of those shapes.
+    if (/^-([ \t]|$)/.test(s)) {
+      throw new Error(`yaml-lite: sequence entry in value position is not supported (got ${JSON.stringify(s)})`);
     }
     // An unquoted plain scalar containing ": " (colon then whitespace) or
     // ending in a bare ":" is invalid where it's reachable from — both a
@@ -818,9 +851,31 @@ function parseWorkflowYaml(text) {
       key = parseScalar(key);
     }
     const rest = (m[2] ?? "").trim();
-    const blockMatch = rest.match(/^([|>])([+-]?)$/);
+    // A block-scalar header may carry an inline comment — "run: | # why"
+    // is real YAML GitHub accepts; verified against yaml.safe_load:
+    // "a: | # c\n  x\n" is {'a': 'x\n'} and "a: | # c\n" is {'a': ''}.
+    // Matching the raw rest missed the header, so the value parsed as the
+    // plain scalar "|" (silently wrong) or died on the indented body as an
+    // unsupported construct. The separation before the comment must be
+    // SPACES — ` +`, not stripInlineComment's \s-shaped idea of
+    // whitespace: "a: |\t# c\n  x\n" raises in yaml.safe_load ("while
+    // scanning a block scalar"), so a tab there must not read as a valid
+    // commented header (Codex review of the first version, which stripped
+    // the comment before matching and so accepted the tab form).
+    const blockMatch = rest.match(/^([|>])([+-]?)(?: +#.*)?$/);
     if (blockMatch) {
       return { key, rest: "", isBlockScalar: true, style: blockMatch[1], chomp: blockMatch[2] };
+    }
+    // Anything ELSE starting with | or > is block-scalar territory that
+    // isn't the supported header form — either invalid YAML ("a: |x",
+    // "a: >=1.2" unquoted, "a: |\t# c" — all raise "while scanning a
+    // block scalar" in yaml.safe_load) or a valid indentation indicator
+    // ("a: |2\n    x\n" => {'a': '  x\n'}) this parser deliberately
+    // doesn't implement. Both previously fell through to parseScalar and
+    // came back as a literal string; throwing keeps the header contract
+    // for out-of-scope constructs either way.
+    if (rest.startsWith("|") || rest.startsWith(">")) {
+      throw new Error(`yaml-lite: unsupported or malformed block scalar header (got ${JSON.stringify(rest)})`);
     }
     return { key, rest, isBlockScalar: false };
   }
