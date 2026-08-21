@@ -217,6 +217,7 @@ jobs:
         env:
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
           BRANCH_REF: ${{ inputs.branch-ref }}
+          COMMIT_MESSAGE: ${{ inputs.commit-message }}
           EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
           COMMENT_MARKER: ${{ inputs.comment-marker }}
@@ -271,6 +272,20 @@ jobs:
           fi
           if [ -z "$BRANCH_REF" ]; then
             echo "::error::branch-ref is '' — checkout would silently fall back to the triggering event's own ref instead of failing. Check the caller's expression (e.g. github.event.pull_request.head.ref is empty on events without a pull_request context)."
+            exit 1
+          fi
+          # required: true only checks the caller supplied the KEY (same as
+          # the inputs above); an empty value would otherwise sail through
+          # download, staging, and diffing before git refuses the commit
+          # much later ("Aborting commit due to empty commit message"),
+          # loud but far from the actual caller mistake. Whitespace-only
+          # counts as empty (Codex review): git's non-editor default
+          # cleanup mode is `whitespace`, which strips trailing whitespace
+          # and empty lines, so `git commit -m '   '` aborts exactly the
+          # same way — the [[:space:]] deletion catches what a bare -z
+          # can't.
+          if [ -z "${COMMIT_MESSAGE//[[:space:]]/}" ]; then
+            echo "::error::commit-message is empty or whitespace-only — git would refuse the commit only after download and staging. Check the caller's expression."
             exit 1
           fi
           if ! [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then

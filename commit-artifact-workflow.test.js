@@ -121,6 +121,7 @@ test("refuses dispatch-workflow without push-token for any trigger other than pu
         env: {
           ...process.env,
           ARTIFACT_NAME: "ui-snapshots",
+          COMMIT_MESSAGE: "Regenerate artifacts",
           BRANCH_REF: "feature/some-branch",
           EXPECTED_HEAD_SHA: "a".repeat(40),
           PR_NUMBER: dispatchWorkflow ? "1" : "",
@@ -184,6 +185,7 @@ test("a caller with no dispatch-workflow set is never refused on trigger alone, 
     env: {
       ...process.env,
       ARTIFACT_NAME: "ui-snapshots",
+      COMMIT_MESSAGE: "Regenerate artifacts",
       BRANCH_REF: "feature/some-branch",
       EXPECTED_HEAD_SHA: "a".repeat(40),
       PR_NUMBER: "",
@@ -283,6 +285,7 @@ test("fails fast on an empty branch-ref, before checkout can silently fall back"
         env: {
           ...process.env,
           ARTIFACT_NAME: "ui-snapshots",
+          COMMIT_MESSAGE: "Regenerate artifacts",
           BRANCH_REF: branchRef,
           EXPECTED_HEAD_SHA: "a".repeat(40),
           PR_NUMBER: "",
@@ -327,6 +330,7 @@ test("fails fast on an empty artifact-name, before download-artifact can silentl
         env: {
           ...process.env,
           ARTIFACT_NAME: artifactName,
+          COMMIT_MESSAGE: "Regenerate artifacts",
           BRANCH_REF: "feature/some-branch",
           EXPECTED_HEAD_SHA: "a".repeat(40),
           PR_NUMBER: "",
@@ -350,6 +354,61 @@ test("fails fast on an empty artifact-name, before download-artifact can silentl
   assert.equal(empty.code, 1, "an empty artifact-name must be rejected");
   assert.match(empty.output, /artifact-name is ''/);
   assert.equal(runCase("ui-snapshots").code, 0, "a real artifact-name must not be rejected");
+});
+
+test("fails fast on an empty commit-message, before git refuses the commit far from the caller", () => {
+  // Same underlying shape as artifact-name and branch-ref: required: true
+  // only checks the caller supplied the KEY, not that its value is
+  // non-empty. An empty commit-message would otherwise sail through
+  // download, staging, and diffing before git aborts the commit much later
+  // ("Aborting commit due to empty commit message") — loud, but far from
+  // the actual caller mistake this step exists to name early.
+  const validateIdx = steps.findIndex((s) => s.name === "Validate the input combination");
+  const validate = steps[validateIdx];
+  assert.equal(validate.env.COMMIT_MESSAGE, "${{ inputs.commit-message }}");
+  // The [[:space:]] deletion, not a bare -z on the raw value — whitespace-
+  // only must be caught too.
+  assert.match(validate.run, /\[ -z "\$\{COMMIT_MESSAGE\/\/\[\[:space:\]\]\/\}" \]/);
+
+  const runCase = (commitMessage) => {
+    try {
+      execFileSync("bash", ["-c", validate.run], {
+        env: {
+          ...process.env,
+          ARTIFACT_NAME: "ui-snapshots",
+          COMMIT_MESSAGE: commitMessage,
+          BRANCH_REF: "feature/some-branch",
+          EXPECTED_HEAD_SHA: "a".repeat(40),
+          PR_NUMBER: "",
+          COMMENT_MARKER: "",
+          DISPATCH_WORKFLOW: "",
+          EVENT_NAME: "pull_request",
+          HAS_PUSH_TOKEN: "false",
+          GITHUB_OUTPUT: "/dev/null",
+          GH_TOKEN: "fake",
+          GITHUB_REPOSITORY: "test-owner/test-repo",
+          GIT_CONFIG_GLOBAL: NO_NETWORK_GIT_CONFIG,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { code: 0 };
+    } catch (e) {
+      return { code: e.status, output: String(e.stdout) + String(e.stderr) };
+    }
+  };
+  const empty = runCase("");
+  assert.equal(empty.code, 1, "an empty commit-message must be rejected");
+  assert.match(empty.output, /commit-message is empty or whitespace-only/);
+  // Whitespace-only is empty too (Codex review): git's non-editor default
+  // cleanup mode (`whitespace`) strips trailing whitespace and empty
+  // lines, so `git commit -m '   '` aborts with the same late "empty
+  // commit message" error the plain-empty case does — verified directly.
+  for (const message of [" ", "   ", "\n", " \n  \n"]) {
+    const ws = runCase(message);
+    assert.equal(ws.code, 1, `a whitespace-only commit-message ${JSON.stringify(message)} must be rejected`);
+    assert.match(ws.output, /commit-message is empty or whitespace-only/);
+  }
+  assert.equal(runCase("Regenerate artifacts").code, 0, "a real commit-message must not be rejected");
 });
 
 test("fails fast on an expected-head-sha that isn't a real full commit SHA", () => {
@@ -1241,6 +1300,7 @@ function runValidateStep(validateStep, workspace, branchRef, expectedHeadSha, ex
       env: {
         ...process.env,
         ARTIFACT_NAME: "example",
+        COMMIT_MESSAGE: "Regenerate artifacts",
         BRANCH_REF: branchRef,
         EXPECTED_HEAD_SHA: expectedHeadSha,
         PR_NUMBER: "",
