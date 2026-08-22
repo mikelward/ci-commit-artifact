@@ -1,11 +1,13 @@
 // Tests for .github/workflows/commit-artifact.yml, asserting real structure
-// via yaml-lite.js rather than regex/string-matching over the serialized
-// text. An earlier draft of this file used regexes (matching npm-update's
-// convention) and produced a genuinely broken test — an unbounded lazy
-// match (`(?:.*\n)*?`) that could span past the input it was checking and
-// match a later, unrelated one — which is exactly the false-pass failure
-// mode this repo's own AGENTS.md warns about. yaml-lite.js exists so this
-// suite can ask real questions of real structure instead.
+// via yaml-lite (the canonical parser at mikelward/yaml-lite, resolved by
+// resolve-yaml-lite.js — no longer a vendored copy) rather than
+// regex/string-matching over the serialized text. An earlier draft of this
+// file used regexes (matching npm-update's convention) and produced a
+// genuinely broken test — an unbounded lazy match (`(?:.*\n)*?`) that
+// could span past the input it was checking and match a later, unrelated
+// one — which is exactly the false-pass failure mode this repo's own
+// AGENTS.md warns about. yaml-lite exists so this suite can ask real
+// questions of real structure instead.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -13,7 +15,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const os = require("node:os");
-const { parseWorkflowYaml } = require("./yaml-lite.js");
+const { parseWorkflowYaml } = require("./resolve-yaml-lite.js");
 
 const WORKFLOW_PATH = path.join(
   __dirname,

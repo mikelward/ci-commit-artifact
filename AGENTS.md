@@ -59,6 +59,11 @@ with defense-in-depth for a threat that isn't present here.
 ## Testing
 
 - `node --test *.test.js`. No install step — there is nothing to install.
+  The one setup step is a one-time
+  `git clone https://github.com/mikelward/yaml-lite ../yaml-lite` (a git
+  clone, not a package manager): the structural tests resolve the parser
+  from CI's `.yaml-lite/` checkout or that sibling clone, and fail with
+  that exact command — never skip — when both are missing.
 - **Add or update tests with any change.** This suite is the only thing
   between a push and every consumer's next run, so a change that ships
   untested ships unreviewed.

@@ -8,7 +8,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { parseWorkflowYaml } = require("./yaml-lite.js");
+const { parseWorkflowYaml } = require("./resolve-yaml-lite.js");
 
 const README_PATH = path.join(__dirname, "README.md");
 const readmeText = fs.readFileSync(README_PATH, "utf8");
