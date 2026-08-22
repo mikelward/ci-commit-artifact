@@ -147,6 +147,12 @@ on:
           branch-ref at, before it was deleted.
         value: ${{ jobs.commit.outputs.commit_sha }}
 
+# Nothing by default: the one job below declares exactly what it needs, and
+# any future job added without its own block gets no token scopes at all
+# instead of inheriting the repository's default GITHUB_TOKEN setting — a
+# setting no file in this repo can read, and one that may be read/write.
+permissions: {}
+
 jobs:
   commit:
     runs-on: ubuntu-latest

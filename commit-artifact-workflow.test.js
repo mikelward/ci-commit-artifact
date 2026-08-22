@@ -51,12 +51,13 @@ test("is callable only via workflow_call, not directly triggerable", () => {
   assert.deepEqual(Object.keys(doc.on), ["workflow_call"]);
 });
 
-test("has no workflow-level permissions block wider than the single job's own", () => {
-  // This workflow has exactly one job, so its own `permissions:` (asserted
-  // below) is the only place permissions should be declared — a
-  // workflow-level block here would either be redundant or, worse, silently
-  // widen what the job gets beyond its own declared needs.
-  assert.equal(doc.permissions, undefined);
+test("grants nothing at the workflow level; the single job declares its own", () => {
+  // Top-level `permissions: {}`, exactly: an ABSENT block would let any
+  // future job added without its own block inherit the repository's default
+  // GITHUB_TOKEN setting (unreadable from here, possibly read/write), while
+  // any non-empty grant would silently widen what such a job gets beyond
+  // nothing. The one job below declares its own needs explicitly.
+  assert.deepEqual(doc.permissions, {});
   // Exact values, not just truthiness — a truthiness-only check stays green
   // even if a scope silently widens (or narrows to the point of breaking
   // the job) to something other than what's actually needed: contents:write
