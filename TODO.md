@@ -2,6 +2,16 @@
 
 Deferred work, recorded here so it isn't lost.
 
+## This repository
+
+- [ ] **Require the new `lanes` and `codex` checks in the main ruleset**
+      (plus conversations resolved) once each has reported at least once —
+      a step outside what a session without ruleset API access can do.
+      ci.yml adopts the post-rename `lanes` check name directly
+      (mikelward/lanes#9), so no gate → lanes migration is needed here, and
+      codex-review.yml republishes Codex's verdict as the `codex` commit
+      status the ruleset can require.
+
 ## Pilot in clothescast — done
 
 This workflow exists to fix a real, live problem in `mikelward/clothescast`
