@@ -4,13 +4,17 @@ Deferred work, recorded here so it isn't lost.
 
 ## This repository
 
-- [ ] **Require the new `lanes` and `codex` checks in the main ruleset**
+- [ ] **Require `lanes`, `codex`, and `zizmor` in the main ruleset**
       (plus conversations resolved) once each has reported at least once —
       a step outside what a session without ruleset API access can do.
       ci.yml adopts the post-rename `lanes` check name directly
-      (mikelward/lanes#9), so no gate → lanes migration is needed here, and
+      (mikelward/lanes#9), so no gate → lanes migration is needed here;
       codex-review.yml republishes Codex's verdict as the `codex` commit
-      status the ruleset can require.
+      status the ruleset can require; and zizmor.yml now runs unfiltered
+      on every pull request precisely so `zizmor` can be required (a
+      paths-filtered workflow creates no check run at all on a
+      non-matching PR, which a ruleset waits on forever — this repo and
+      mikelward/lanes pilot the change for the fleet).
 
 ## Pilot in clothescast — done
 
