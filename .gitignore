@@ -1,0 +1,3 @@
+# CI's checkout of the canonical yaml-lite parser (see ci.yml); also keeps
+# a local clone at this path out of accidental commits.
+.yaml-lite/
