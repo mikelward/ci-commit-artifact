@@ -101,5 +101,33 @@ different kind of artifact:
       push-token: ${{ secrets.CI_COMMIT_ARTIFACT_TOKEN }}
 ```
 
+## Keep the token in an environment: pass `secrets: inherit`
+
+A repository-level `CI_COMMIT_ARTIFACT_TOKEN` reaches every job of every
+workflow in the consumer that inherits it -- including the untrusted
+update jobs of the weekly dependency batches (mikelward/npm-update,
+gradle-update, rust-update), which run whatever they resolved and take
+`secrets: inherit` from their callers. The `commit` job here runs nothing
+from the pull request, so it is the right scope for the PAT and nothing
+else is: keep the token as `CI_COMMIT_ARTIFACT_TOKEN` in an environment
+named `ci-commit-artifact` (the `environment` input's default; the job
+declares it, and reads the environment secret ahead of `push-token`), and
+pass `secrets: inherit` instead of naming the secret -- an environment
+secret reaches a called workflow no other way:
+
+```yaml
+    uses: mikelward/ci-commit-artifact/.github/workflows/commit-artifact.yml@main
+    with:
+      # ... same as above
+    secrets: inherit
+```
+
+`repo setup --credential CI_COMMIT_ARTIFACT_TOKEN=PATH OWNER/REPO` in
+mikelward/repo makes the move -- sets the environment secret, then deletes
+the repository-level copy -- and refuses while a caller still names the
+secret, since the copy is what that caller passes. The environment needs
+no protection rules; a required reviewer there would hold every
+screenshot commit for approval.
+
 See `.github/workflows/commit-artifact.yml` for the full input/output
 reference, and `AGENTS.md` for the reasoning behind each guard.

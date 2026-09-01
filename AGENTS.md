@@ -56,6 +56,22 @@ with defense-in-depth for a threat that isn't present here.
   for one) belongs in the *render* job, before the artifact is uploaded —
   never here.
 
+## The token's home is the caller's `ci-commit-artifact` environment
+
+- **The `commit` job declares `environment: ${{ inputs.environment }}`
+  (default `ci-commit-artifact`) and reads `CI_COMMIT_ARTIFACT_TOKEN`
+  ahead of `push-token`.** Not for this workflow's own sake -- its one
+  job runs nothing from the pull request either way -- but for the
+  caller's: a repository-level token reaches every job of every workflow
+  that inherits the caller's secrets, the dependency batches' untrusted
+  update jobs included. An environment secret reaches only a job that
+  declares the environment, and a caller cannot put `environment:` on a
+  job that `uses:` a reusable workflow, so it has to be declared here.
+  `push-token` stays for a caller that names its secrets; both routes read
+  the same PAT, and `HAS_PUSH_TOKEN` and the push must keep seeing the
+  same value, or an inheriting caller would retrigger CI twice. `repo
+  setup` in mikelward/repo does the move and fills this environment.
+
 ## Testing
 
 - `node --test *.test.js`. No install step — there is nothing to install.
