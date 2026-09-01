@@ -134,6 +134,9 @@ with defense-in-depth for a threat that isn't present here.
   interjection — address it in your very next output, before starting or
   continuing any further tool call, even if it's only one sentence. Don't let
   it queue up behind an in-flight chain of tool calls.
+- **Don't narrate routine machinery.** A check run flipping, a re-run, a scheduled check
+  re-arming, a webhook echo, a resolved thread — act on those silently; the noise buries
+  the one line that matters.
 - **One question at a time**, asked in plain chat rather than a structured
   picker, and wait for the answer before proceeding on an assumed one.
 
