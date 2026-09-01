@@ -103,12 +103,33 @@ on:
         required: false
         type: string
         default: 'file'
+      environment:
+        description: >-
+          The deployment environment the commit job declares, so that a
+          token kept as an environment secret there reaches this job and
+          no other. Consumers across this fleet keep the PAT as
+          CI_COMMIT_ARTIFACT_TOKEN in an environment of this name and pass
+          `secrets: inherit` rather than naming it under `secrets:` -- a
+          secret named in a `secrets:` block, or kept at the repository
+          level, reaches every job of every workflow that inherits it,
+          including the untrusted jobs of the dependency batches, which
+          run whatever they resolved. This job runs nothing from the pull
+          request, which is what makes it the right scope. The
+          environment is created on first use if it does not exist; keep
+          it free of protection rules (a required reviewer would hold
+          every screenshot commit for approval).
+        required: false
+        type: string
+        default: ci-commit-artifact
     secrets:
       push-token:
         description: >-
           A fine-grained PAT (Contents: read and write, scoped to this
           repository only) used to push the commit instead of the job's own
-          GITHUB_TOKEN. A GITHUB_TOKEN-authored push starts no workflow run
+          GITHUB_TOKEN. Named here only by a caller that passes secrets by
+          name; a caller passing `secrets: inherit` keeps the same PAT as
+          CI_COMMIT_ARTIFACT_TOKEN in the `environment` above instead, and
+          this job reads that first. A GITHUB_TOKEN-authored push starts no workflow run
           on its own, which is why dispatch-workflow exists — but dispatching
           onto branch-ref is safe ONLY when the CALLING workflow's own
           trigger (github.event_name, read directly below rather than taken
@@ -156,6 +177,11 @@ permissions: {}
 jobs:
   commit:
     runs-on: ubuntu-latest
+    # The one job, so the one place the caller's CI_COMMIT_ARTIFACT_TOKEN
+    # environment secret is read -- see the input. Declared on the job
+    # rather than left to the caller: a caller cannot put `environment:`
+    # on a job that `uses:` a reusable workflow.
+    environment: ${{ inputs.environment }}
     # Declared explicitly as a ceiling, not left to inherit whatever the
     # caller's own workflow-level grant happens to be — a reusable
     # workflow's job permissions are honored but capped by the caller, never
@@ -241,7 +267,7 @@ jobs:
           # Not itself spliced anywhere below or logged — only ever tested
           # for emptiness, via a bare shell string comparison rather than a
           # command whose argv or output could land in the run log.
-          HAS_PUSH_TOKEN: ${{ secrets.push-token != '' }}
+          HAS_PUSH_TOKEN: ${{ (secrets.CI_COMMIT_ARTIFACT_TOKEN || secrets.push-token) != '' }}
           # Read-only: github.token always has at least read access to this
           # job's own repository under the permissions block above,
           # regardless of whether a caller supplied push-token.
@@ -623,7 +649,10 @@ jobs:
           # the safe remaining cases: pull_request_target with no
           # dispatch-workflow at all (caller retriggers some other way), or
           # plain pull_request (dispatch-workflow, if set, is safe there).
-          GH_TOKEN: ${{ secrets.push-token || github.token }}
+          # CI_COMMIT_ARTIFACT_TOKEN is the environment secret an inheriting
+          # caller supplies (see the environment input); push-token the one
+          # a caller names. Whichever is set is the same PAT.
+          GH_TOKEN: ${{ secrets.CI_COMMIT_ARTIFACT_TOKEN || secrets.push-token || github.token }}
           # Same reasoning as the guard step: none of these are safe to
           # splice directly into the script.
           BRANCH_REF: ${{ inputs.branch-ref }}

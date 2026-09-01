@@ -98,6 +98,52 @@ test("declares push-token as an optional secret", () => {
   assert.equal(secrets["push-token"].required, false);
 });
 
+test("the commit job declares the environment input, defaulting to ci-commit-artifact", () => {
+  // A caller keeping the PAT as an environment secret passes
+  // `secrets: inherit`, and an environment secret reaches only a job that
+  // declares the environment -- which has to be this job, since a caller
+  // cannot put `environment:` on a job that `uses:` a reusable workflow.
+  // The default is the fleet's convention, so a caller with no `with:`
+  // entry for it lands on the same environment `repo setup` fills.
+  const input = doc.on.workflow_call.inputs.environment;
+  assert.ok(input, "missing input: environment");
+  assert.equal(input.required, false);
+  assert.equal(input.default, "ci-commit-artifact");
+  assert.equal(doc.jobs.commit.environment, "${{ inputs.environment }}");
+});
+
+test("the token is read from the environment secret first, then push-token, then GITHUB_TOKEN", () => {
+  // Both the push and the validation that decides whether a push-token
+  // push retriggers CI must see the same token: if one read the
+  // environment secret and the other only push-token, an inheriting
+  // caller would push as a real user and STILL dispatch a redundant run
+  // (or, worse, be refused as having no token at all).
+  assert.equal(
+    step("Commit and push").env.GH_TOKEN,
+    "${{ secrets.CI_COMMIT_ARTIFACT_TOKEN || secrets.push-token || github.token }}",
+  );
+  assert.equal(
+    step("Validate the input combination").env.HAS_PUSH_TOKEN,
+    "${{ (secrets.CI_COMMIT_ARTIFACT_TOKEN || secrets.push-token) != '' }}",
+  );
+  // And those two are the COMPLETE set of secret readers, compared whole:
+  // the dispatch step deliberately uses github.token, and a step added
+  // later that reads a secret -- under any env name, these two included --
+  // has to show up here rather than slip past a per-key exemption (Codex,
+  // PR #11). No step splices a secret into a run: block either.
+  const readers = [];
+  for (const s of steps) {
+    for (const [key, value] of Object.entries(s.env || {})) {
+      if (/secrets\./.test(String(value))) readers.push([s.name, key]);
+    }
+    assert.doesNotMatch(String(s.run || ""), /secrets\./, `${s.name}: run block reads a secret`);
+  }
+  assert.deepEqual(readers, [
+    ["Validate the input combination", "HAS_PUSH_TOKEN"],
+    ["Commit and push", "GH_TOKEN"],
+  ]);
+});
+
 test("refuses dispatch-workflow without push-token for any trigger other than pull_request", () => {
   // The caller's trigger is read from github.event_name directly (Codex
   // review, PR #1) -- not a caller-supplied input, which a caller could get
