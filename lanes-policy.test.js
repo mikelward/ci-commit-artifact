@@ -45,15 +45,29 @@ const classify = (path) => {
 describe("the lane policy", () => {
   test("parses to the intended shape, nothing wider", () => {
     // A rule this suite has not vetted is a rule nothing here exercises.
-    assert.deepEqual(rules, [{ verdict: "docs", pattern: "**/*.md" }]);
+    // The ORDER is part of the shape: README.md is code only because its
+    // rule comes first.
+    assert.deepEqual(rules, [
+      { verdict: "code", pattern: "README.md" },
+      { verdict: "docs", pattern: "**/*.md" },
+    ]);
     assert.deepEqual(directives.prefixes, ["docs"]);
     assert.deepEqual(directives["dispatch-without-pr"], ["refuse"]);
   });
 
-  test("markdown rides the docs lane, at the root and nested", () => {
-    for (const path of ["README.md", "AGENTS.md", "docs/notes.md"]) {
+  test("markdown nothing reads rides the docs lane, at the root and nested", () => {
+    for (const path of ["AGENTS.md", "TODO.md", "docs/notes.md"]) {
       assert.equal(classify(path), "docs", path);
     }
+  });
+
+  test("README.md is a test fixture, so it rides the code lane", () => {
+    // readme.test.js extracts every ```yaml block from README.md and asserts
+    // it parses, so an edit to README.md is an edit to what the suite
+    // requires. Classified as docs — as it was until this test was written —
+    // a broken consumer-facing example merges under a green required check
+    // with the one test that checks it never having run.
+    assert.equal(classify("README.md"), "code");
   });
 
   test("everything a consumer's weekly run executes is code", () => {
