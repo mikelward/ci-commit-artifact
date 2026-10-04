@@ -49,6 +49,7 @@ describe("the lane policy", () => {
     // rule comes first.
     assert.deepEqual(rules, [
       { verdict: "code", pattern: "README.md" },
+      { verdict: "code", pattern: "AGENTS.md" },
       { verdict: "docs", pattern: "**/*.md" },
     ]);
     assert.deepEqual(directives.prefixes, ["docs"]);
@@ -56,9 +57,15 @@ describe("the lane policy", () => {
   });
 
   test("markdown nothing reads rides the docs lane, at the root and nested", () => {
-    for (const path of ["AGENTS.md", "TODO.md", "docs/notes.md"]) {
+    for (const path of ["TODO.md", "docs/notes.md"]) {
       assert.equal(classify(path), "docs", path);
     }
+  });
+
+  test("AGENTS.md carries tested front matter, so it rides the code lane", () => {
+    // agents-front-matter.test.js asserts the front matter at its top; as
+    // docs, an AGENTS.md-only edit could break it with that test never run.
+    assert.equal(classify("AGENTS.md"), "code");
   });
 
   test("README.md is a test fixture, so it rides the code lane", () => {
