@@ -50,6 +50,8 @@ describe("the lane policy", () => {
     assert.deepEqual(rules, [
       { verdict: "code", pattern: "README.md" },
       { verdict: "code", pattern: "AGENTS.md" },
+      { verdict: "code", pattern: "CLAUDE.md" },
+      { verdict: "code", pattern: "GEMINI.md" },
       { verdict: "docs", pattern: "**/*.md" },
     ]);
     assert.deepEqual(directives.prefixes, ["docs"]);
@@ -66,6 +68,14 @@ describe("the lane policy", () => {
     // agents-front-matter.test.js asserts the front matter at its top; as
     // docs, an AGENTS.md-only edit could break it with that test never run.
     assert.equal(classify("AGENTS.md"), "code");
+  });
+
+  test("CLAUDE.md and GEMINI.md are tested symlinks, so they ride the code lane", () => {
+    // agents-front-matter.test.js asserts both link to AGENTS.md; as docs, a
+    // links-only edit could break that with the test never run.
+    for (const path of ["CLAUDE.md", "GEMINI.md"]) {
+      assert.equal(classify(path), "code", path);
+    }
   });
 
   test("README.md is a test fixture, so it rides the code lane", () => {
