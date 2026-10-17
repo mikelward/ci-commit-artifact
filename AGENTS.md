@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-15
+last_modified: 2026-10-17
 ---
 
 # AGENTS.md
@@ -201,8 +201,9 @@ with defense-in-depth for a threat that isn't present here.
   doesn't count), a review or a push alone (its report rides the next message), routine
   machinery, or a mistake caught and fixed before it reached the repo. The session-start
   `AGENTS.md` line still opens every session.
-- **One question at a time**, asked in plain chat rather than a structured
-  picker, and wait for the answer before proceeding on an assumed one.
+- **One question at a time** — in plain chat or the client's question tool
+  (`AskUserQuestion` in Claude Code, `ask_question` in Antigravity); stop and
+  wait for the answer before proceeding on an assumed one.
 
 ## Privacy
 
