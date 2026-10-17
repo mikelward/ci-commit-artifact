@@ -47,3 +47,14 @@ test("the guide tells agents to report the loaded file at session start", () => 
   assert.match(text, /At\s+the\s+start\s+of\s+every\s+session,\s+print\s+the\s+full\s+absolute\s+path\s+of\s+the\s+`AGENTS\.md`\s+you\s+loaded/);
   assert.match(text, /Bump\s+`last_modified`\s+whenever\s+you\s+edit\s+this\s+file/);
 });
+
+// Claude Code reads CLAUDE.md and Gemini / Antigravity read GEMINI.md; each
+// must stay a symlink to AGENTS.md, or that client loses the shared rules
+// while every test above, which reads AGENTS.md directly, still passes.
+for (const name of ["CLAUDE.md", "GEMINI.md"]) {
+  test(`${name} is a symlink to AGENTS.md`, () => {
+    const file = path.join(__dirname, name);
+    assert.ok(fs.lstatSync(file).isSymbolicLink(), `${name} must be a symlink`);
+    assert.equal(fs.readlinkSync(file), "AGENTS.md");
+  });
+}
