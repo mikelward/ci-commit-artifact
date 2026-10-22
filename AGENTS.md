@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -123,9 +123,12 @@ in this process) with defense-in-depth against an absent threat.
   over-strict one (privacy especially, where stricter feels safer) costs real
   capability. A genuine rule-vs-code conflict is the maintainer's call, not
   one to settle by quietly narrowing the code. Declining doesn't clear the
-  required `codex` status: post the rebuttal, then `@codex review` once (or
-  let the next push, if the rebuttal is up first); escalate if it re-raises,
-  or if that review hasn't landed five minutes on.
+  required `codex` status: post the rebuttal, then `@codex review` (or let
+  the next push, if the rebuttal is up first); escalate if it re-raises. A
+  hung review — nothing back five minutes after a push or poke, or stuck at
+  running (👀) ten minutes on — gets `@codex review`; a poke that hangs the
+  same way gets a second an hour later, and only a second that hangs too is
+  escalated, never the first (maintainer, 2026-10-22).
 - **Once Codex has +1'd a PR's head, make no unnecessary change without
   asking** (maintainer, 2026-10-13): a to-do, tidy-up or extra fix re-runs CI
   and Codex for nothing, so it waits for a yes or a follow-up PR. A necessary
@@ -144,10 +147,9 @@ in this process) with defense-in-depth against an absent threat.
 - **Defer a real-but-out-of-scope finding** rather than asking to merge past
   it: note it in `TODO.md`, commit and push that first (it's this PR's review
   closeout, not a separate topic), reply citing the sha, and resolve. A
-  threadless finding (top-level comment or review body) gets the record,
-  push and reply; only the resolve is skipped. The push re-triggers Codex,
-  so poke only if five minutes pass with nothing back; escalate if the
-  re-review re-raises it, or is still missing five minutes after the poke.
+  threadless finding (top-level comment or review body) gets the record, push
+  and reply; only the resolve is skipped. The push re-triggers Codex, so poke
+  only once it hangs, as above; escalate if the re-review re-raises it.
 
 ## Language and spelling
 
