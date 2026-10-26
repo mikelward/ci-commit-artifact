@@ -20,7 +20,7 @@ each re-derive (and re-harden) the git-config/git-hook isolation it needs.
 Consumers track `@main`, so **a merge here reaches every consumer's next run
 with no release step in between** — everything below follows from that.
 
-Keep this file short — **under 24,000 bytes** (`wc -c AGENTS.md`):
+Keep this file short — **under 22,000 bytes** (`wc -c AGENTS.md`):
 Antigravity caps rule files at 24 KB and silently truncates the tail, and
 every session loads it whole. Add a rule the first time something bites, say
 it once in the fewest words that carry the *why*, rewrite or trim rather than
